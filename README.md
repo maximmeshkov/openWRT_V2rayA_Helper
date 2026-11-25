@@ -67,7 +67,7 @@ ubus call v2raya-helper status
 
 ```sh
 ./scripts/feeds update -a
-./scripts/feeds install libcurl libjson-c libpthread ca-bundle rpcd luci-mod-status
+./scripts/feeds install libcurl libjson-c ca-bundle rpcd luci-mod-status
 printf '%s\n' CONFIG_PACKAGE_v2raya-helper=m CONFIG_PACKAGE_luci-app-v2raya-helper=m >> .config
 make defconfig
 make package/v2raya-helper/compile V=s
@@ -76,7 +76,7 @@ make package/v2raya-helper/compile V=s
 Для локальных тестов под Linux нужны компилятор C, заголовки libcurl и json-c, а также Python 3. Тесты поднимают локальные сервисы и запускают тот же процесс, что используется на роутере.
 
 ```sh
-cc -std=gnu11 -O2 -Wall -Wextra -Werror src/*.c -lcurl -ljson-c -pthread -o /tmp/v2raya-helper-test
+cc -std=gnu11 -O2 -Wall -Wextra -Werror src/*.c -lcurl -ljson-c -o /tmp/v2raya-helper-test
 V2RAYA_HELPER=/tmp/v2raya-helper-test python3 -m unittest discover -s tests -v
 ```
 

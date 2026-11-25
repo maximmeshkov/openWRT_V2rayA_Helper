@@ -6,7 +6,6 @@
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <poll.h>
-#include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -72,12 +71,11 @@ static int is_loopback(const char *ip)
                    (IN6_IS_ADDR_V4MAPPED(&v6) && v6.s6_addr[12] == 127))));
 }
 
-static void *probe_one(void *arg)
+static void probe_one(struct probe *p)
 {
-    struct probe *p = arg;
     if (!strcmp(p->member->transport, "quic")) {
         p->member->server = probe_quic(p->member->address, p->timeout, p->mark);
-        return NULL;
+        return;
     }
     struct measurement result = {.state = "unknown", .detail = "probe_unavailable"};
     CURLU *url = endpoint_url(p->member->address);
@@ -127,20 +125,19 @@ done:
     p->member->server = result;
     if (c) curl_easy_cleanup(c);
     if (url) curl_url_cleanup(url);
-    return NULL;
 }
 
-/* On builds with a synchronous resolver, libcurl's NOSIGNAL timeout cannot
- * interrupt getaddrinfo. On these builds the caller is single-threaded: fork
- * before probing, then bound the entire batch with a parent-side deadline.
+/* A resolver may block beyond libcurl's timeout even on threaded-resolver
+ * builds. Fork our workers from the main loop and bound the whole batch.
  * Both measurement strings are static literals in the same executable mapping
  * inherited by fork. No child-owned heap pointer travels in the reply. */
-static void probe_sync_resolver(struct member **jobs, size_t count, long timeout_ms, uint32_t mark)
+void probe_members(struct member **jobs, size_t count, long timeout_ms, uint32_t mark)
 {
     struct reply { size_t slot; struct measurement sample; };
     int channel[2];
     pid_t workers[16] = {0};
     int received[16] = {0};
+    if (!count) return;
     for (size_t i = 0; i < count; ++i)
         jobs[i]->server = (struct measurement) {
             .state = "unknown", .detail = "probe_unavailable", .checked = time(NULL)
@@ -196,23 +193,4 @@ static void probe_sync_resolver(struct member **jobs, size_t count, long timeout
         }
         while (waitpid(workers[i], NULL, 0) < 0 && errno == EINTR) {}
     }
-}
-
-void probe_members(struct member **jobs, size_t count, long timeout_ms, uint32_t mark)
-{
-    /* --workers is restricted to 1..16 by the caller. */
-    if (!(curl_version_info(CURLVERSION_NOW)->features & CURL_VERSION_ASYNCHDNS)) {
-        probe_sync_resolver(jobs, count, timeout_ms, mark);
-        return;
-    }
-    pthread_t threads[16];
-    struct probe probes[16];
-    int started[16];
-    for (size_t i = 0; i < count; ++i) {
-        probes[i] = (struct probe){.member = jobs[i], .timeout = timeout_ms, .mark = mark};
-        started[i] = pthread_create(&threads[i], NULL, probe_one, &probes[i]) == 0;
-        if (!started[i]) probe_one(&probes[i]);
-    }
-    for (size_t i = 0; i < count; ++i)
-        if (started[i]) pthread_join(threads[i], NULL);
 }

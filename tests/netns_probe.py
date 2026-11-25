@@ -1,4 +1,4 @@
-"""Privileged Linux integration test. Usage: sudo python3 tests/netns_probe.py BINARY"""
+"""Usage: sudo python3 tests/netns_probe.py BINARY [--dns-only]"""
 import contextlib
 import json
 import os
@@ -48,6 +48,7 @@ def counter(name):
 
 def wait_for_state(proc, path, state, tick):
     deadline = time.monotonic() + 10
+    data = None
     while time.monotonic() < deadline:
         if proc.poll() is not None:
             raise AssertionError("monitor exited early")
@@ -57,14 +58,52 @@ def wait_for_state(proc, path, state, tick):
             if server_state(data, "proxy") == state:
                 return data["outbounds"][0]["members"][0]["server"]
         time.sleep(0.05)
-    raise AssertionError(f"monitor did not publish {state}")
+    raise AssertionError(f"monitor did not publish {state}; last local fixture output: {data}")
 
 
-def isolated_test(binary, original_netns):
-    # This assertion runs before *any* link or firewall change. The parent
-    # keeps its network namespace open and passes that descriptor via unshare.
-    if os.path.samestat(os.fstat(original_netns), os.stat("/proc/self/ns/net")):
-        raise RuntimeError("refusing to change the caller's networking")
+def test_dns_deadline(binary, tmp, api, target_port, *, check_mark):
+    # This bind mount exists only in our private mount namespace. A live UDP
+    # listener consumes no packets, so an unbounded resolver would wait 8 s.
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as dns:
+        dns.bind(("127.0.0.1", 53))
+        dns.settimeout(5)
+        resolv = tmp / "resolv.conf"
+        resolv.write_text("nameserver 127.0.0.1\noptions timeout:4 attempts:2\n")
+        subprocess.run(["mount", "--bind", str(resolv), "/etc/resolv.conf"], check=True)
+        with api.lock:
+            api.names = ["numeric", "hostname"]
+            api.servers = [profile(1, "Address", f"127.0.0.1:{target_port}", "socks5"),
+                           profile(2, "Slow DNS", "silent.example.test:443", "tuic")]
+            api.connected = [assignment("numeric", 1), assignment("hostname", 2)]
+        path = tmp / "dns.json"
+        options = [] if check_mark else ["--mark", "0"]
+        with monitor(binary, api, path, "--interval", "60", *options) as proc:
+            query, _ = dns.recvfrom(4096)
+            if b"\x06silent\x07example\x04test" not in query:
+                raise AssertionError("expected the configured hostname in the DNS query")
+            started = time.monotonic()
+            while time.monotonic() - started < 3:
+                if path.exists():
+                    snapshot = json.loads(path.read_text())
+                    if server_state(snapshot, "hostname") == "timeout":
+                        break
+                time.sleep(0.02)
+            else:
+                raise AssertionError("synchronous DNS blocked the monitor beyond its deadline")
+            if server_state(snapshot, "numeric") != "ok":
+                raise AssertionError("healthy peer's result was lost during DNS timeout")
+            children = Path(f"/proc/{proc.pid}/task/{proc.pid}/children")
+            if children.read_text().strip():
+                raise AssertionError("probe worker still exists after publishing the timeout")
+            print(f"Silent DNS probe timed out after {time.monotonic()-started:.2f}s; "
+                  "numeric peer remained healthy and no child worker remained.")
+
+
+def isolated_test(binary, original_netns, original_mountns, dns_only):
+    # Both assertions run before *any* link, firewall or mount change.
+    for fd, ns in ((original_netns, "net"), (original_mountns, "mnt")):
+        if os.path.samestat(os.fstat(fd), os.stat(f"/proc/self/ns/{ns}")):
+            raise RuntimeError(f"refusing to change the caller's {ns} namespace")
     subprocess.run(["ip", "link", "set", "lo", "up"], check=True)
     with contextlib.ExitStack() as stack:
         tmp = Path(stack.enter_context(tempfile.TemporaryDirectory()))
@@ -72,6 +111,9 @@ def isolated_test(binary, original_netns):
         stack.callback(api.close)
         target = stack.enter_context(listener())
         port = target.getsockname()[1]
+        if dns_only:
+            test_dns_deadline(binary, tmp, api, port, check_mark=False)
+            return
         api.servers = [profile(1, "TCP target", f"127.0.0.1:{port}", "socks5")]
         api.connected = [assignment("proxy", 1)]
         rules = f"""
@@ -134,16 +176,24 @@ table inet v2raya_probe_test {{
         exchange()
         print(f"Unmarked SYN rejected; {accepted} default-mark TCP probes accepted. "
               f"One application connection completed {exchanges} request/reply exchanges.")
+        test_dns_deadline(binary, tmp, api, port, check_mark=True)
 
 
 if __name__ == "__main__":
-    if len(sys.argv) == 4 and sys.argv[2] == "--isolated":
-        isolated_test(sys.argv[1], int(sys.argv[3]))
+    dns_only = "--dns-only" in sys.argv
+    if dns_only:
+        sys.argv.remove("--dns-only")
+    if len(sys.argv) == 5 and sys.argv[2] == "--isolated":
+        isolated_test(sys.argv[1], int(sys.argv[3]), int(sys.argv[4]), dns_only)
     elif len(sys.argv) == 2:
         binary = Path(sys.argv[1]).resolve(strict=True)
-        with open("/proc/self/ns/net", "rb", buffering=0) as ns:
-            args = ["unshare", "--net", "--", sys.executable, __file__,
-                    str(binary), "--isolated", str(ns.fileno())]
-            sys.exit(subprocess.run(args, pass_fds=(ns.fileno(),)).returncode)
+        with contextlib.ExitStack() as stack:
+            fds = [stack.enter_context(open(f"/proc/self/ns/{ns}", "rb", buffering=0)).fileno()
+                   for ns in ("net", "mnt")]
+            args = ["unshare", "--net", "--mount", "--propagation", "private", "--",
+                    sys.executable, __file__, str(binary), "--isolated", *map(str, fds)]
+            if dns_only:
+                args.append("--dns-only")
+            sys.exit(subprocess.run(args, pass_fds=fds).returncode)
     else:
         sys.exit(__doc__)

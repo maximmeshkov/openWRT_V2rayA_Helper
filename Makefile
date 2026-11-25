@@ -2,7 +2,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=v2raya-helper
 PKG_VERSION:=0.1.0
-PKG_RELEASE:=1
+PKG_RELEASE:=2
 
 include $(INCLUDE_DIR)/package.mk
 
@@ -10,7 +10,7 @@ define Package/v2raya-helper
   SECTION:=net
   CATEGORY:=Network
   TITLE:=Background monitor for v2rayA outbounds
-  DEPENDS:=+libcurl +libjson-c +libpthread +ca-bundle +rpcd
+  DEPENDS:=+libcurl +libjson-c +ca-bundle +rpcd
   URL:=https://github.com/maximmeshkov/openWRT_V2rayA_Helper
 endef
 
@@ -33,9 +33,9 @@ define Build/Prepare
 endef
 
 define Build/Compile
-	$(TARGET_CC) $(TARGET_CPPFLAGS) $(TARGET_CFLAGS) -std=gnu11 -pthread \
+	$(TARGET_CC) $(TARGET_CPPFLAGS) $(TARGET_CFLAGS) -std=gnu11 \
 		-o $(PKG_BUILD_DIR)/v2raya-helper $(PKG_BUILD_DIR)/*.c \
-		$(TARGET_LDFLAGS) -lcurl -ljson-c -pthread
+		$(TARGET_LDFLAGS) -lcurl -ljson-c
 endef
 
 define Package/v2raya-helper/install

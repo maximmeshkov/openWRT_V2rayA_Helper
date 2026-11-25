@@ -13,7 +13,7 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y libcurl4-openssl-dev libjson-c-dev nftables iproute2
-          cc -std=gnu11 -Wall -Wextra -Werror -O2 src/*.c -lcurl -ljson-c -pthread -o /tmp/v2raya-helper-test
+          cc -std=gnu11 -Wall -Wextra -Werror -O2 src/*.c -lcurl -ljson-c -o /tmp/v2raya-helper-test
           V2RAYA_HELPER=/tmp/v2raya-helper-test python3 -m unittest discover -s tests -v
           sudo python3 tests/netns_probe.py /tmp/v2raya-helper-test
 
@@ -50,7 +50,7 @@ jobs:
           mkdir -p package/v2raya-helper
           cp -r "$GITHUB_WORKSPACE"/{Makefile,files,src} package/v2raya-helper/
           ./scripts/feeds update -a
-          ./scripts/feeds install libcurl libjson-c libpthread ca-bundle rpcd luci-mod-status
+          ./scripts/feeds install libcurl libjson-c ca-bundle rpcd luci-mod-status
           printf '%s\n' CONFIG_PACKAGE_v2raya-helper=m CONFIG_PACKAGE_luci-app-v2raya-helper=m >> .config
           make defconfig
           make -j"$(nproc)" package/v2raya-helper/compile V=s
