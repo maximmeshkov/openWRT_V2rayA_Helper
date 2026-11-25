@@ -1,0 +1,10 @@
+{
+	"v2raya-helper": {
+		"description": "Read v2rayA outbound monitoring results",
+		"read": {
+			"ubus": {
+				"v2raya-helper": [ "status" ]
+			}
+		}
+	}
+}

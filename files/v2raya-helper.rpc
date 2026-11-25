@@ -1,0 +1,18 @@
+#!/bin/sh
+
+case "$1" in
+	list)
+		printf '%s\n' '{"status":{}}'
+		;;
+	call)
+		[ "$2" = status ] || exit 3
+		printf '{"router_unix":%s,"snapshot":' "$(date +%s)"
+		if [ -r /var/run/v2raya-helper/status.json ]; then
+			cat /var/run/v2raya-helper/status.json || exit 1
+		else
+			printf '%s' '{"state":"starting","outbounds":[]}'
+		fi
+		printf '}\n'
+		;;
+	*) exit 3 ;;
+esac
