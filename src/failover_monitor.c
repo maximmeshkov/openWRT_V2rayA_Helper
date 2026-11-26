@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #include "failover_monitor.h"
 #include "failover_api.h"
+#include "failover_endpoint.h"
 #include "failover_policy.h"
 #include "failover_profile.h"
 #include "node_profile.h"
@@ -221,7 +222,7 @@ static struct failover_sample active_sample(const struct member *member)
 }
 
 static struct failover_sample probe_candidate(struct failover_monitor *m, const struct failover_node *node,
-    const char *outbound, const char *link)
+    const struct failover_policy *policy, const char *link)
 {
     struct report {
         struct measurement sample;
@@ -229,6 +230,14 @@ static struct failover_sample probe_candidate(struct failover_monitor *m, const 
     } result = {0};
     struct failover_profile profile = {0};
     if (failover_profile_parse(link, &profile)) return (struct failover_sample){0};
+    if (policy->exclusions && json_object_array_length(policy->exclusions)) {
+        /* Verify the actual probe endpoint as well as its catalogue identity. */
+        char address[FAILOVER_ENDPOINT_LIMIT + 1], endpoint[FAILOVER_ENDPOINT_LIMIT + 1];
+        const char *format = strchr(profile.node.host, ':') ? "[%s]:%d" : "%s:%d";
+        int length = snprintf(address, sizeof(address), format, profile.node.host, profile.node.port);
+        if (length < 0 || (size_t)length >= sizeof(address) ||
+            !failover_endpoint_normalize(address, endpoint) || strcmp(endpoint, node->endpoint)) goto done;
+    }
     int channel[2];
     if (pipe2(channel, O_CLOEXEC | O_NONBLOCK) < 0) goto done;
     pid_t parent = getpid(), child = fork();
@@ -254,7 +263,7 @@ static struct failover_sample probe_candidate(struct failover_monitor *m, const 
     close(channel[0]);
 done:
     failover_profile_clear(&profile);
-    latency_history_add(m->history, outbound, node->name, node->key, &result.sample, "reserve");
+    latency_history_add(m->history, policy->outbound, node->name, node->key, &result.sample, "reserve");
     return (struct failover_sample){.state = classify(&result.sample, result.code), .ms = result.sample.ms,
                                     .checked = result.sample.checked};
 }
@@ -354,16 +363,17 @@ static int switch_candidate(struct failover_monitor *m, const struct failover_po
         size_t index = status->next_candidate++ % pool.total_count;
         const char *subscription;
         const struct failover_node *candidate = pool_candidate(&pool, &catalog, policy, index, &subscription);
-        if (!candidate || candidate == current) continue;
+        if (!candidate || candidate == current || failover_policy_excludes(policy, candidate->endpoint)) continue;
         char *link = failover_api_profile(&m->api, candidate, error, sizeof(error));
         if (!link) {
             /* A large feed must not trigger a burst of profile exports. */
             if (subscription) break;
             continue;
         }
-        struct failover_sample result = probe_candidate(m, candidate, policy->outbound, link);
+        struct failover_sample result = probe_candidate(m, candidate, policy, link);
         result.id = candidate->key;
         result.subscription = subscription;
+        result.endpoint = candidate->endpoint;
         int lock = failover_lock_settings(m->lock_path);
         if (lock >= 0) {
             json_object *fresh = failover_settings_read(m->path);

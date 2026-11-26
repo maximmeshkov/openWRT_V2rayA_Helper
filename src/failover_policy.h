@@ -25,6 +25,7 @@ struct failover_policy {
     enum failover_failure_method failure_method;
     unsigned failure_window_minutes;
     json_object *subscriptions;
+    json_object *exclusions;
 };
 
 struct failover_sample {
@@ -33,6 +34,7 @@ struct failover_sample {
     long ms;
     time_t checked;
     const char *subscription;
+    const char *endpoint;
 };
 
 struct failover_streak {
@@ -44,7 +46,7 @@ struct failover_streak {
     time_t failure_times[FAILOVER_MAX_FAILURES];
 };
 
-/* Entry shape: {outbound, mode, candidates, subscriptions?, failures?, max_ms?,
+/* Entry shape: {outbound, mode, candidates, subscriptions?, exclusions?, failures?, max_ms?,
  * cooldown_seconds?, start?, end?, failure_method?, failure_window_minutes?}.
  * Settings shape: {policies:[entries]}.
  * A missing file means no policies. Malformed or unreadable files return NULL. */
@@ -54,6 +56,8 @@ int failover_settings_write(const char *path, json_object *settings);
 
 /* Check an explicit node key or a uniquely resolved subscription's key. */
 int failover_policy_selects(const struct failover_policy *policy, const char *id, const char *subscription);
+/* A saved exclusion list also rules out candidates with unverifiable endpoints. */
+int failover_policy_excludes(const struct failover_policy *policy, const char *endpoint);
 
 /* A failed sample is a confirmed probe failure. Unsupported or unavailable
  * means UNKNOWN and clears the run. active id must change with its profile. */

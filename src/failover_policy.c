@@ -1,4 +1,6 @@
+#define _DEFAULT_SOURCE
 #define _POSIX_C_SOURCE 200809L
+#include "failover_endpoint.h"
 #include "failover_policy.h"
 #include "utf8.h"
 #include <errno.h>
@@ -29,6 +31,12 @@ static int valid_id(const char *id)
     static const char allowed[] =
         "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz-_.:";
     return id && *id && strlen(id) <= FAILOVER_ID_LIMIT && strspn(id, allowed) == strlen(id);
+}
+
+static int canonical_endpoint(const char *endpoint)
+{
+    char normalized[FAILOVER_ENDPOINT_LIMIT + 1];
+    return endpoint && failover_endpoint_normalize(endpoint, normalized) && !strcmp(endpoint, normalized);
 }
 
 static int valid_outbound(const char *name)
@@ -66,14 +74,14 @@ static int minute(const char *s, unsigned *out)
     return 1;
 }
 
-static int checked_keys(json_object *keys)
+static int checked_keys(json_object *keys, int (*valid)(const char *))
 {
     if (!json_object_is_type(keys, json_type_array)) return 0;
     size_t count = json_object_array_length(keys);
     if (count > FAILOVER_SELECTION_LIMIT) return 0;
     for (size_t i = 0; i < count; i++) {
         const char *id = read_string(json_object_array_get_idx(keys, i));
-        if (!valid_id(id)) return 0;
+        if (!valid(id)) return 0;
         for (size_t j = 0; j < i; j++)
             if (!strcmp(id, read_string(json_object_array_get_idx(keys, j)))) return 0;
     }
@@ -92,9 +100,11 @@ int failover_policy_parse(json_object *entry, struct failover_policy *policy)
         .failure_window_minutes = FAILOVER_DEFAULT_WINDOW_MINUTES,
     };
     const char *mode = field(entry, "mode");
-    if (!mode || !valid_outbound(policy->outbound) || !checked_keys(policy->candidates) ||
+    if (!mode || !valid_outbound(policy->outbound) || !checked_keys(policy->candidates, valid_id) ||
         (json_object_object_get_ex(entry, "subscriptions", &policy->subscriptions) &&
-         !checked_keys(policy->subscriptions)))
+         !checked_keys(policy->subscriptions, valid_id)) ||
+        (json_object_object_get_ex(entry, "exclusions", &policy->exclusions) &&
+         !checked_keys(policy->exclusions, canonical_endpoint)))
         return -1;
     if (!strcmp(mode, "off")) policy->mode = FAILOVER_OFF;
     else if (!strcmp(mode, "outage")) policy->mode = FAILOVER_OUTAGE;
@@ -290,6 +300,12 @@ int failover_policy_selects(const struct failover_policy *policy, const char *id
     return listed(policy->candidates, id) || listed(policy->subscriptions, subscription);
 }
 
+int failover_policy_excludes(const struct failover_policy *policy, const char *endpoint)
+{
+    return policy->exclusions && json_object_array_length(policy->exclusions) &&
+           (!canonical_endpoint(endpoint) || listed(policy->exclusions, endpoint));
+}
+
 int failover_policy_ready(const struct failover_policy *policy,
                 const struct failover_sample *active, const struct failover_streak *streak,
                 time_t now, long maximum_age, time_t last_switch)
@@ -325,6 +341,7 @@ const char *failover_policy_choose(const struct failover_policy *policy,
         const struct failover_sample *sample = &samples[i];
         if (!valid_id(sample->id) || !strcmp(sample->id, active->id) ||
             !failover_policy_selects(policy, sample->id, sample->subscription) ||
+            failover_policy_excludes(policy, sample->endpoint) ||
             sample->state != FAILOVER_OK || sample->ms < 0 || !fresh(sample, now, maximum_age) ||
             sample->checked < active->checked ||
             (active->state == FAILOVER_OK && sample->ms > (long)policy->max_ms))

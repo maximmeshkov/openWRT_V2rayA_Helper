@@ -26,6 +26,7 @@ var readHistory = rpc.declare({
 
 var candidateLimit = 64;
 var subscriptionLimit = 64;
+var exclusionLimit = 64;
 var outboundKey = 'v2raya-helper-failover-outbound';
 
 function row(title, control) {
@@ -48,13 +49,14 @@ function rangeInput(id, min, max) {
 
 function newPolicy(outbound, saved) {
 	var policy = Object.assign({
-		outbound: outbound, mode: 'off', candidates: [], subscriptions: [], failures: 3,
+		outbound: outbound, mode: 'off', candidates: [], subscriptions: [], exclusions: [], failures: 3,
 		failure_method: 'consecutive', failure_window_minutes: 10,
 		max_ms: 0, cooldown_seconds: 900, start: '', end: ''
 	}, saved || {});
 	policy.outbound = outbound;
 	policy.candidates = policy.candidates.slice();
 	policy.subscriptions = policy.subscriptions.slice();
+	policy.exclusions = policy.exclusions.slice();
 	return policy;
 }
 
@@ -78,7 +80,7 @@ function validContext(reply) {
 function matchesSaved(requested, stored) {
 	return stored && Object.keys(requested).every(function(field) {
 		if (field === 'allow_restart') return true;
-		if (field === 'candidates' || field === 'subscriptions')
+		if (field === 'candidates' || field === 'subscriptions' || field === 'exclusions')
 			return Array.isArray(stored[field]) && requested[field].length === stored[field].length &&
 				requested[field].every(function(key, index) { return key === stored[field][index]; });
 		return requested[field] === stored[field];
@@ -110,6 +112,7 @@ return view.extend({
 		var context, selected = session.getLocalData(outboundKey) || '', busy = false;
 		var drafts = new Map(), saved = new Map(), catalogue = new Map(), dirty = new Set(), unverified = new Map();
 		var subscriptionCatalogue = new Map();
+		var catalogueRows = new Map();
 		var restartConsent = new Set();
 		var timing = null, timingTarget = null, timingRequests = 0, timingBusy = false;
 		var outbound = E('select', { 'id': 'failover-outbound', 'class': 'cbi-input-select' });
@@ -153,6 +156,10 @@ return view.extend({
 			E('h3', {}, [_('Any server from a subscription')]),
 			subscriptionChoices
 		]);
+		var exclusionList = E('div', { 'id': 'failover-exclusions', 'class': 'cbi-value-field' });
+		var exclusionSection = E('div', { 'class': 'cbi-value' }, [
+			E('h3', {}, [_('Always excluded')]), exclusionList
+		]);
 		var count = E('p');
 		var removeUnavailable = E('button', {
 			'id': 'failover-remove-unavailable', 'type': 'button', 'class': 'btn cbi-button cbi-button-neutral'
@@ -184,6 +191,7 @@ return view.extend({
 		]);
 		var candidateFields = E('fieldset', { 'class': 'cbi-section' }, [
 			subscriptionSection,
+			exclusionSection,
 			row(_('Replacement servers'), search),
 			E('div', { 'style': 'display:flex;flex-wrap:wrap;align-items:baseline;gap:.5em' }, [count, removeUnavailable]),
 			list
@@ -327,7 +335,8 @@ return view.extend({
 			schedule.hidden = mode.value !== 'scheduled';
 			updateConsent();
 			save.hidden = !canWrite;
-			save.disabled = busy || !context || !selected || !dirty.has(selected) || (enabled && !context.can_switch);
+			save.disabled = busy || !context || !selected || !dirty.has(selected) ||
+				(enabled && (!context.can_switch || (draft().exclusions.length && context.supports_exclusions !== true)));
 			refresh.disabled = busy;
 			showSavedMode();
 			showTiming();
@@ -344,17 +353,62 @@ return view.extend({
 			});
 		}
 
-		function showCandidates() {
+		function changeExclusion(endpoint, exclude, focusKey) {
+			if (!draft() || !canWrite || busy || !context || context.supports_exclusions !== true) return;
+			var exclusions = new Set(draft().exclusions);
+			if (exclude) {
+				if (exclusions.size >= exclusionLimit) {
+					message(_('Select at most 64 exclusions.'), true);
+					return;
+				}
+				exclusions.add(endpoint);
+			} else {
+				exclusions.delete(endpoint);
+			}
+			draft().exclusions = Array.from(exclusions);
+			markEdited();
+			showExclusions();
+			showCandidates(focusKey);
+			message(exclude ? _('Excluded %s in this draft. Save to apply.').format(endpoint) :
+				_('Removed the exclusion for %s in this draft. Save to apply.').format(endpoint), false);
+		}
+
+		function showExclusions() {
+			exclusionList.textContent = '';
+			var exclusions = draft() ? draft().exclusions : [];
+			exclusionSection.hidden = !exclusions.length;
+			var canRemove = context && context.supports_exclusions === true && canWrite;
+			exclusions.forEach(function(endpoint) {
+				var line = E('div', { 'style': 'display:flex;align-items:center;flex-wrap:wrap;gap:.5em' }, [E('code', {}, [endpoint])]);
+				if (canRemove) {
+					var remove = E('button', { 'type': 'button', 'class': 'btn cbi-button cbi-button-neutral',
+						'aria-label': _('Remove exclusion for %s').format(endpoint) }, [_('Remove exclusion')]);
+					remove.addEventListener('click', function() {
+						changeExclusion(endpoint, false);
+						search.focus();
+					});
+					line.appendChild(remove);
+				}
+				exclusionList.appendChild(line);
+			});
+		}
+
+		function showCandidates(focusKey) {
+			var previousScroll = list.scrollTop, focusButton = null;
 			list.textContent = '';
 			if (!draft())
 				return;
 			var chosen = new Set(draft().candidates);
+			var excluded = new Set(draft().exclusions);
+			var supportsExclusions = context.supports_exclusions === true;
 			var filter = search.value.trim().toLowerCase();
-			var visible = 0;
+			var rendered = new Set();
 
-			function candidate(key, label, missing) {
+			function candidate(key, label, missing, endpoint) {
+				var blocked = excluded.has(endpoint);
 				var checkbox = E('input', { 'type': 'checkbox' });
 				checkbox.checked = chosen.has(key);
+				checkbox.disabled = blocked || (missing && !checkbox.checked);
 				checkbox.addEventListener('change', function() {
 					if (checkbox.checked) {
 						if (chosen.size >= candidateLimit) {
@@ -372,24 +426,41 @@ return view.extend({
 					if (missing)
 						showCandidates();
 				});
-				list.appendChild(E('div', { 'class': 'cbi-value' }, [
-					E('label', {}, [checkbox, ' ', label])
-				]));
-				visible++;
+				var line = E('div', { 'class': 'cbi-value', 'style': 'display:flex;align-items:center;flex-wrap:wrap;gap:.5em' }, [
+					E('label', {}, [checkbox, ' ', blocked ? label + ' · ' + _('Excluded') : label])
+				]);
+				if (supportsExclusions && canWrite && endpoint) {
+					var button = E('button', { 'type': 'button', 'class': 'btn cbi-button cbi-button-neutral',
+						'aria-label': (blocked ? _('Remove exclusion for %s') : _('Exclude %s')).format(endpoint) },
+						[blocked ? _('Remove exclusion') : _('Exclude')]);
+					button.addEventListener('click', function() { changeExclusion(endpoint, !blocked, key); });
+					line.appendChild(button);
+					if (focusKey === key) focusButton = button;
+				}
+				list.appendChild(line);
+				rendered.add(key);
 			}
 
-			catalogue.forEach(function(node, key) {
+			(supportsExclusions ? catalogueRows : catalogue).forEach(function(node, key) {
+				var missing = !catalogue.has(key);
+				if (missing && !node.endpoint) return;
 				var label = [node.name || node.address, node.address, node.net].filter(Boolean).join(' · ');
-				if (chosen.has(key) || !filter || label.toLowerCase().includes(filter))
-					candidate(key, label, false);
+				if (chosen.has(key) || !filter || label.toLowerCase().includes(filter)) {
+					if (missing) label += ' · ' + _('Ambiguous server');
+					candidate(key, label, missing, node.endpoint);
+				}
 			});
 			chosen.forEach(function(key) {
-				if (!catalogue.has(key))
+				if (!rendered.has(key))
 					candidate(key, _('Selected server unavailable. Deselect to remove it.'), true);
 			});
-			if (!visible)
+			if (!rendered.size)
 				list.appendChild(E('p', {}, [_('No matching servers.')]));
 			showCandidateCount();
+			if (focusButton) {
+				list.scrollTop = previousScroll;
+				focusButton.focus({ preventScroll: true });
+			}
 		}
 
 		function showSubscriptions() {
@@ -442,6 +513,8 @@ return view.extend({
 			count.textContent = _('Selected servers: %d').format(chosen.length);
 			if (subscriptions.length)
 				count.textContent += ' · ' + _('Subscriptions: %d').format(subscriptions.length);
+			if (draft().exclusions.length)
+				count.textContent += ' · ' + _('Excluded endpoints: %d').format(draft().exclusions.length);
 			removeUnavailable.hidden = !missing || context.catalog_unavailable || !canWrite;
 			if (missing && !context.catalog_unavailable)
 				count.textContent += ' · ' + _('Unavailable: %d').format(missing);
@@ -467,6 +540,7 @@ return view.extend({
 				current.textContent = target && target.current || _('No single current server');
 			}
 			showSubscriptions();
+			showExclusions();
 			showCandidates();
 			showPresetSources();
 			updateControls();
@@ -485,10 +559,12 @@ return view.extend({
 			}
 			context = reply;
 			catalogue = new Map();
+			catalogueRows = new Map();
 			subscriptionCatalogue = new Map((Array.isArray(reply.subscriptions) ? reply.subscriptions : [])
 				.map(function(source) { return [source.key, source]; }));
 			var ambiguous = new Set();
 			reply.nodes.forEach(function(node) {
+				if (!catalogueRows.has(node.key)) catalogueRows.set(node.key, node);
 				if (catalogue.has(node.key)) {
 					catalogue.delete(node.key);
 					ambiguous.add(node.key);
@@ -552,6 +628,7 @@ return view.extend({
 				allow_restart: false
 			};
 			if (Array.isArray(context.subscriptions)) policy.subscriptions = input.subscriptions;
+			if (context.supports_exclusions === true) policy.exclusions = input.exclusions;
 			if (input.mode !== 'off') {
 				var subscriptions = policy.subscriptions || [];
 				if ((!policy.candidates.length && !subscriptions.length) ||

@@ -15,12 +15,12 @@ class Policy(C.Structure):
                 ("cooldown", C.c_uint), ("start", C.c_uint), ("end", C.c_uint),
                 ("outbound", C.c_char_p), ("candidates", C.c_void_p),
                 ("failure_method", C.c_int), ("failure_window_minutes", C.c_uint),
-                ("subscriptions", C.c_void_p)]
+                ("subscriptions", C.c_void_p), ("exclusions", C.c_void_p)]
 
 
 class Sample(C.Structure):
     _fields_ = [("id", C.c_char_p), ("state", C.c_int), ("ms", C.c_long),
-                ("checked", C.c_long), ("subscription", C.c_char_p)]
+                ("checked", C.c_long), ("subscription", C.c_char_p), ("endpoint", C.c_char_p)]
 
 
 class Streak(C.Structure):
@@ -178,6 +178,25 @@ class FailoverPolicyTest(unittest.TestCase):
                                      Sample(b"new", OK, 6, NOW, b"chosen-feed"),
                                      Sample(b"manual", OK, 4, NOW)), b"manual")
 
+    def test_exclusions_veto_explicit_and_subscribed_candidates_by_endpoint(self):
+        p = self.policy(candidates=["manual", "unknown"], subscriptions=["feed"],
+                        exclusions=["skip.example:443", "[2001:db8::1]:1080"])
+        streak, failure = self.streak(p)
+        unsuitable = (
+            Sample(b"manual", OK, 1, NOW, None, b"skip.example:443"),
+            Sample(b"renamed", OK, 2, NOW, b"feed", b"skip.example:443"),
+            Sample(b"duplicate", OK, 3, NOW, b"feed", b"[2001:db8::1]:1080"),
+            Sample(b"unknown", OK, 4, NOW),
+            Sample(b"malformed", OK, 5, NOW, b"feed", b"invalid-address"),
+        )
+        self.assertIsNone(self.chosen(p, streak, failure, *unsuitable))
+        self.assertEqual(self.chosen(p, streak, failure, *unsuitable,
+                                     Sample(b"ready", OK, 6, NOW, b"feed", b"skip.example:8443")), b"ready")
+
+        cleared = self.policy(candidates=["unknown"], exclusions=[])
+        streak, failure = self.streak(cleared)
+        self.assertEqual(self.chosen(cleared, streak, failure, Sample(b"unknown", OK, 4, NOW)), b"unknown")
+
     def test_scheduled_rolling_window_keeps_only_the_latest_thirty_failures(self):
         p = self.policy(mode="scheduled", start="23:58", end="00:01", failures=30,
                         failure_method="window", failure_window_minutes=1)
@@ -220,6 +239,12 @@ class FailoverPolicyTest(unittest.TestCase):
                           {"subscriptions": None}, {"subscriptions": "feed"},
                           {"subscriptions": ["same", "same"]},
                           {"subscriptions": list(map(str, range(65)))},
+                          {"exclusions": None}, {"exclusions": "skip.example:443"},
+                          {"exclusions": ["skip.example:443", "skip.example:443"]},
+                          {"exclusions": ["Skip.Example:443"]}, {"exclusions": ["skip.example:0443"]},
+                          {"exclusions": ["0x7f000001:443"]}, {"exclusions": ["0x7f.0.0.1:443"]},
+                          {"exclusions": ["https://skip.example:443"]}, {"exclusions": ["skip.example:65536"]},
+                          {"exclusions": [f"host{i}.example:443" for i in range(65)]},
                           {"mode": "scheduled", "start": "24:00", "end": "06:00"},
                           {"mode": "scheduled", "start": "05:00", "end": "05:00"}):
             with self.subTest(overrides=overrides):
@@ -241,6 +266,12 @@ class FailoverPolicyTest(unittest.TestCase):
             self.assertTrue(round_trip)
             self.jsonc.json_object_put(round_trip)
             self.assertEqual(self.lib.failover_settings_write(path, self.json({"policies": good["policies"] * 2})), -1)
+            self.assertEqual(json.loads(settings.read_text()), good)
+            good["policies"][0]["exclusions"] = ["192.0.2.1:443", "[2001:db8::1]:1080"]
+            self.assertEqual(self.lib.failover_settings_write(path, self.json(good)), 0)
+            round_trip = self.lib.failover_settings_read(path)
+            self.assertTrue(round_trip)
+            self.jsonc.json_object_put(round_trip)
             self.assertEqual(json.loads(settings.read_text()), good)
             settings.write_bytes(b'{"policies":[{"outbound":"\xc0\xaf","mode":"off","candidates":[]}]}')
             self.assertFalse(self.lib.failover_settings_read(path))

@@ -82,6 +82,7 @@ static int append_nodes(struct failover_catalogue *cat, json_object *servers, in
         *node = (struct failover_node){.id=id, .sub=sub, .name=name, .address=address,
                                        .net=net, .subscription_key=subscription_key};
         node_key(node->key, type, subscription_key, name, address, net);
+        failover_endpoint_normalize(address, node->endpoint);
     }
     return 1;
 }
@@ -266,7 +267,8 @@ int failover_api_connect(const struct v2raya_api *api, const char *outbound,
     const struct failover_node *active = failover_catalogue_active(&cat, outbound);
     const struct failover_node *next = failover_catalogue_find(&cat, candidate->key);
     int result = -1;
-    if (!cat.running || !same_node(active, expected_active) || !same_node(next, candidate)) {
+    if (!cat.running || !same_node(active, expected_active) || !same_node(next, candidate) ||
+        strcmp(next->endpoint, candidate->endpoint)) {
         snprintf(error, len, "v2rayA assignment or candidate changed before failover");
         goto done;
     }

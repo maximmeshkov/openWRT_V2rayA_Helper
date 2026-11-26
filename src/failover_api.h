@@ -1,6 +1,7 @@
 #ifndef V2RAYA_HELPER_FAILOVER_API_H
 #define V2RAYA_HELPER_FAILOVER_API_H
 
+#include "failover_endpoint.h"
 #include "v2raya_api.h"
 #include <stdint.h>
 
@@ -10,6 +11,7 @@ struct failover_node {
     /* Private subscription identity. Never put it in UI or policy data. */
     const char *subscription_key;
     char key[33];
+    char endpoint[FAILOVER_ENDPOINT_LIMIT + 1];
 };
 
 struct failover_subscription {

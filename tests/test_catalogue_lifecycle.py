@@ -3,6 +3,8 @@ import json
 import os
 import subprocess
 import time
+from socketserver import ThreadingTCPServer
+from threading import Thread
 from urllib.parse import parse_qs, quote, urlsplit
 from unittest.mock import patch
 
@@ -77,16 +79,25 @@ class CatalogueLifecycle(NodeFixture):
     def tmp_path(self, name):
         return self.config.with_name(name)
 
-    def install_catalogue(self, manual, subscriptions, *, remarks=None):
+    def another_proxy_port(self):
+        socks = ThreadingTCPServer(("127.0.0.1", 0), self.socks.RequestHandlerClass)
+        socks.daemon_threads = True
+        self.addCleanup(socks.server_close)
+        self.addCleanup(socks.shutdown)
+        Thread(target=socks.serve_forever, daemon=True).start()
+        return socks.server_address[1]
+
+    def install_catalogue(self, manual, subscriptions, *, remarks=None, ports=None):
         links = {}
 
         def servers(items, sub):
             result = []
             kind = "server" if sub is None else "subscriptionServer"
             for number, (name, password) in enumerate(items, 1):
-                result.append(dict(profile(number, name, f"127.0.0.1:{self.port}", "socks5"), _type=kind))
+                port = (ports or {}).get(name, self.port)
+                result.append(dict(profile(number, name, f"127.0.0.1:{port}", "socks5"), _type=kind))
                 links[sub, number] = (
-                    f"socks5://fixture:{quote(password)}@127.0.0.1:{self.port}#{quote(name)}"
+                    f"socks5://fixture:{quote(password)}@127.0.0.1:{port}#{quote(name)}"
                 )
             return result
 
@@ -108,7 +119,7 @@ class CatalogueLifecycle(NodeFixture):
             self.api.connected.append(assignment(tag, number, sub=sub))
             outbounds.append({
                 "tag": tag, "protocol": "socks", "settings": {"servers": [{
-                    "address": "127.0.0.1", "port": self.port,
+                    "address": "127.0.0.1", "port": urlsplit(self.links[sub, number]).port,
                     "users": [{"user": "fixture", "pass": password}],
                 }]},
             })
@@ -140,11 +151,14 @@ class CatalogueLifecycle(NodeFixture):
             "failure_method": "consecutive", "failures": 3, "allow_restart": True,
         }})
 
-    def save_subscription_policy(self, subscription, candidates=()):
-        return self.command("failover", "save", {"policy": {
+    def save_subscription_policy(self, subscription, candidates=(), *, exclusions=None):
+        policy = {
             "outbound": "proxy", "mode": "outage", "candidates": list(candidates),
             "subscriptions": [subscription], "failures": 3, "allow_restart": True,
-        }})
+        }
+        if exclusions is not None:
+            policy["exclusions"] = exclusions
+        return self.command("failover", "save", {"policy": policy})
 
     def start_monitor(self, interval=1):
         with patch.dict(os.environ, SSL_CERT_FILE=self.cert):
@@ -239,6 +253,124 @@ class CatalogueLifecycle(NodeFixture):
         self.start_monitor()
         self.wait_member("Manual reserve", "ok")
         self.assertEqual(self.posts, [{"_type": "server", "outbound": "proxy", "id": 2}])
+
+    def test_endpoint_exclusions_override_both_sources_across_catalogue_refresh(self):
+        blocked_port = self.another_proxy_port()
+        excluded_endpoint = f"127.0.0.1:{blocked_port}"
+        unavailable_endpoint = "192.0.2.210:443"
+        manual = [("Primary", "wrong"), ("Unselected manual", "correct"),
+                  ("Blocked manual", "correct")]
+        unrelated = (self.early_feed, [("Unselected subscription member", "correct")])
+        with self.api.lock:
+            self.install_catalogue(manual, [unrelated, (self.main_feed, [("Blocked member", "correct")])],
+                                   remarks={self.main_feed: "Selected feed"},
+                                   ports={"Blocked manual": blocked_port, "Blocked member": blocked_port})
+            self.set_active_locked(None, 1, "wrong")
+        original = self.catalogue()
+        self.assertTrue(original["supports_exclusions"])
+        nodes = {node["name"]: node for node in original["nodes"]}
+        for name in ("Blocked manual", "Blocked member"):
+            self.assertEqual(nodes[name]["endpoint"], excluded_endpoint)
+        subscription = next(item["key"] for item in original["subscriptions"]
+                            if item["name"] == "Selected feed")
+        manual_key = nodes["Blocked manual"]["key"]
+        saved = self.save_subscription_policy(subscription, [manual_key],
+                                              exclusions=[excluded_endpoint, unavailable_endpoint])
+        self.assertTrue(saved["ok"], saved)
+        self.assertCountEqual(self.catalogue()["policies"][0]["exclusions"],
+                              [excluded_endpoint, unavailable_endpoint])
+
+        self.start_monitor()
+        self.wait_for(lambda _: len(self.auth_failures) >= 4, timeout=15)
+        self.assertFalse(self.shares, "excluded endpoints must be skipped before profile export")
+        self.assertFalse(self.posts)
+
+        self.hold.set()
+        try:
+            with self.api.lock:
+                self.install_catalogue([manual[0], manual[2]], [(self.main_feed, [
+                    ("Renamed blocked member", "correct"), ("Allowed new member", "correct"),
+                ]), unrelated], ports={"Blocked manual": blocked_port, "Renamed blocked member": blocked_port})
+            updated = self.catalogue()
+            nodes_after = {node["name"]: node for node in updated["nodes"]}
+            self.assertEqual(nodes_after["Blocked manual"]["key"], manual_key)
+            self.assertNotEqual(nodes_after["Renamed blocked member"]["key"], nodes["Blocked member"]["key"])
+            self.assertEqual(nodes_after["Renamed blocked member"]["endpoint"], excluded_endpoint)
+            self.assertCountEqual(updated["policies"][0]["exclusions"], [excluded_endpoint, unavailable_endpoint])
+            self.assertTrue(self.waiting.wait(15), "allowed new member did not reach its HTTPS check")
+            self.assertFalse(self.posts, "the allowed member was assigned before its probe completed")
+        finally:
+            self.release.set()
+        final = self.wait_member("Allowed new member", "ok")
+        self.assertEqual(rows(final)["proxy"]["members"][0]["https"]["http_code"], 204)
+        self.assertEqual(self.posts, [{"_type": "subscriptionServer", "outbound": "proxy", "id": 2, "sub": 0}])
+        self.assertTrue(self.shares)
+        self.assertTrue(all(share == {"_type": "subscriptionServer", "id": 2, "sub": 0} for share in self.shares),
+                        self.shares)
+
+    def test_catalogue_normalizes_endpoint_spellings(self):
+        addresses = {
+            "Domain": ("reserve.EXAMPLE.:0443", "reserve.example:443"),
+            "IPv4": ("127.0.0.1:443", "127.0.0.1:443"),
+            "IPv4-mapped IPv6": ("[::ffff:127.0.0.1]:443", "127.0.0.1:443"),
+            "IPv6": ("[2001:0DB8:0:0::0001]:443", "[2001:db8::1]:443"),
+            "Octal IPv4": ("0177.0.0.01:443", None),
+            "Hex IPv4": ("0x7f000001:443", None),
+        }
+        with self.api.lock:
+            self.install_catalogue([("Primary", "wrong"), *((name, "correct") for name in addresses)], [])
+            self.set_active_locked(None, 1, "wrong")
+            for server in self.api.servers[1:]:
+                server["address"] = addresses[server["name"]][0]
+        nodes = {node["name"]: node for node in self.catalogue()["nodes"]}
+        self.assertEqual({name: nodes[name].get("endpoint") for name in addresses},
+                         {name: endpoint for name, (_, endpoint) in addresses.items()})
+
+    def test_exclusion_saved_during_reserve_probe_prevents_switch(self):
+        reserve_port = self.another_proxy_port()
+        with self.api.lock:
+            self.install_catalogue([("Primary", "wrong")], [(self.main_feed, [("Reserve", "correct")])],
+                                   ports={"Reserve": reserve_port})
+            self.set_active_locked(None, 1, "wrong")
+        subscription = self.catalogue()["subscriptions"][0]["key"]
+        original = self.save_subscription_policy(subscription)
+        self.assertTrue(original["ok"], original)
+        self.hold.set()
+        self.start_monitor()
+        try:
+            self.assertTrue(self.waiting.wait(15), "reserve never reached the HTTPS check")
+            self.assertFalse(self.posts)
+            self.assertEqual(self.shares, [{"_type": "subscriptionServer", "id": 1, "sub": 0}])
+            excluded_endpoint = f"127.0.0.1:{reserve_port}"
+            saved = self.save_subscription_policy(subscription, exclusions=[excluded_endpoint])
+            self.assertTrue(saved["ok"], saved)
+            self.assertEqual(self.catalogue()["policies"][0]["exclusions"], [excluded_endpoint])
+        finally:
+            self.release.set()
+        previous_failures = len(self.auth_failures)
+        self.wait_for(lambda _: len(self.auth_failures) >= previous_failures + 2, timeout=12)
+        self.assertFalse(self.posts, "an in-flight successful probe overrode the newly saved exclusion")
+        self.assertEqual(self.shares, [{"_type": "subscriptionServer", "id": 1, "sub": 0}])
+
+    def test_candidate_export_cannot_redirect_probe_to_an_excluded_endpoint(self):
+        blocked_port = self.another_proxy_port()
+        with self.api.lock:
+            self.install_catalogue([("Primary", "wrong")], [(self.main_feed, [("Reserve", "correct")])])
+            self.set_active_locked(None, 1, "wrong")
+            self.links[0, 1] = f"socks5://fixture:correct@127.0.0.1:{blocked_port}#Reserve"
+        catalogue = self.catalogue()
+        self.assertEqual(next(node["endpoint"] for node in catalogue["nodes"] if node["name"] == "Reserve"),
+                         f"127.0.0.1:{self.port}")
+        saved = self.save_subscription_policy(catalogue["subscriptions"][0]["key"],
+                                              exclusions=[f"127.0.0.1:{blocked_port}"])
+        self.assertTrue(saved["ok"], saved)
+        self.start_monitor()
+        target = {"_type": "subscriptionServer", "id": 1, "sub": 0}
+        self.wait_for(lambda _: target in self.shares, timeout=15)
+        previous_failures = len(self.auth_failures)
+        self.wait_for(lambda _: len(self.auth_failures) >= previous_failures + 2, timeout=12)
+        self.assertFalse(self.seen, "an exported profile generated traffic to the excluded endpoint")
+        self.assertFalse(self.posts)
 
     def test_subscription_becoming_ambiguous_during_probe_cannot_switch(self):
         manual = [("Primary", "wrong")]

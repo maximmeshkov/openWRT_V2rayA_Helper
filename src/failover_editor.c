@@ -54,8 +54,8 @@ static const char *store_policy(const char *path, const struct inventory *inv,
     json_object *settings = failover_settings_read(path);
     const char *failure = "Cannot save switching settings";
     if (settings) {
-        const char *const fields[] = {"outbound", "mode", "candidates", "subscriptions", "failures", "failure_method",
-                                     "failure_window_minutes",
+        const char *const fields[] = {"outbound", "mode", "candidates", "subscriptions", "exclusions",
+                                     "failures", "failure_method", "failure_window_minutes",
                                      "max_ms", "cooldown_seconds", "start", "end"};
         json_object *entry = json_object_new_object();
         json_object *entries = json_object_object_get(settings, "policies");
@@ -86,6 +86,7 @@ static const char *show_failover(json_object *reply, const char *path,
     json_object_object_add(reply, "outbounds", outbounds);
     json_object_object_add(reply, "nodes", nodes);
     json_object_object_add(reply, "subscriptions", subscriptions);
+    json_object_object_add(reply, "supports_exclusions", json_object_new_boolean(1));
     json_object *policies = json_object_object_get(settings, "policies");
     json_object_object_add(reply, "policies", json_object_get(policies));
     if (version) add_text(reply, "version", version);
@@ -105,6 +106,7 @@ static const char *show_failover(json_object *reply, const char *path,
         add_text(entry, "name", node->name);
         add_text(entry, "address", node->address);
         add_text(entry, "net", node->net);
+        if (*node->endpoint) add_text(entry, "endpoint", node->endpoint);
         json_object_array_add(nodes, entry);
     }
     for (size_t i = 0; catalog && i < catalog->subscription_count; i++) {
