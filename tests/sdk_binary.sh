@@ -19,7 +19,9 @@ tar -xzOf "$1" ./data.tar.gz | tar -xz -C "$tmp" ./usr/bin/v2raya-helper
 export V2RAYA_TEST_BINARY="$tmp/usr/bin/v2raya-helper"
 cat > "$tmp/run-helper" <<'EOF'
 #!/bin/sh
-exec qemu-aarch64 -L "$V2RAYA_TEST_SYSROOT" "$V2RAYA_TEST_BINARY" "$@"
+# Use the SDK libraries while keeping the host filesystem root visible to openat().
+exec qemu-aarch64 "$V2RAYA_TEST_SYSROOT/lib/ld-musl-aarch64.so.1" \
+	--library-path "$V2RAYA_TEST_SYSROOT/lib:$V2RAYA_TEST_SYSROOT/usr/lib" "$V2RAYA_TEST_BINARY" "$@"
 EOF
 chmod 755 "$tmp/run-helper"
 "$tmp/run-helper" --help

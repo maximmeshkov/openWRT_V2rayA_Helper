@@ -121,7 +121,7 @@ int failover_policy_parse(json_object *entry, struct failover_policy *policy)
     if (!number(entry, "failures", &policy->failures, FAILOVER_DEFAULT_FAILURES, FAILOVER_MAX_FAILURES) ||
         !number(entry, "failure_window_minutes", &policy->failure_window_minutes, 1, 180) ||
         !number(entry, "max_ms", &policy->max_ms, 0, 60000) ||
-        !number(entry, "cooldown_seconds", &policy->cooldown_seconds, 60, 86400))
+        !number(entry, "cooldown_seconds", &policy->cooldown_seconds, 60, FAILOVER_MAX_COOLDOWN))
         return -1;
     if (policy->mode == FAILOVER_SCHEDULED &&
         (!minute(field(entry, "start"), &policy->start_minute) ||
@@ -215,10 +215,14 @@ int failover_settings_write(const char *path, json_object *settings)
     return status;
 }
 
+static int fresh_time(time_t checked, time_t now, long age)
+{
+    return checked > 0 && checked <= now && age >= 0 && difftime(now, checked) <= age;
+}
+
 static int fresh(const struct failover_sample *sample, time_t now, long age)
 {
-    return sample && sample->checked > 0 && sample->checked <= now && age >= 0 &&
-           difftime(now, sample->checked) <= age;
+    return sample && fresh_time(sample->checked, now, age);
 }
 
 static unsigned expired_failures(const struct failover_streak *streak,
@@ -249,16 +253,16 @@ void failover_record(struct failover_streak *streak, const struct failover_polic
                      const struct failover_sample *active, time_t now, long maximum_age)
 {
     if (!streak || !policy) return;
-    if (!fresh(active, now, maximum_age) || !valid_id(active->id) ||
+    if (!active || active->checked <= 0 || active->checked > now || !valid_id(active->id) ||
         (active->state != FAILOVER_FAILED && (active->state != FAILOVER_OK || active->ms < 0))) {
         *streak = (struct failover_streak){0};
         return;
     }
     if (policy->mode == FAILOVER_OFF || strcmp(streak->id, active->id) || streak->checked > now)
         *streak = (struct failover_streak){0};
-    if (policy->mode == FAILOVER_OFF || active->checked <= streak->checked) return;
-    if (streak->checked && difftime(active->checked, streak->checked) > maximum_age)
-        streak->failed = streak->slow = 0;
+    /* The queue can take longer than the actionable age to revisit this outbound. */
+    if (policy->mode == FAILOVER_OFF || active->checked <= streak->checked ||
+        !fresh(active, now, maximum_age)) return;
     memcpy(streak->id, active->id, strlen(active->id) + 1);
     streak->checked = active->checked;
     streak->latest = active->state;
@@ -306,16 +310,15 @@ int failover_policy_excludes(const struct failover_policy *policy, const char *e
            (!canonical_endpoint(endpoint) || listed(policy->exclusions, endpoint));
 }
 
-int failover_policy_ready(const struct failover_policy *policy,
-                const struct failover_sample *active, const struct failover_streak *streak,
-                time_t now, long maximum_age, time_t last_switch)
+static int switch_conditions(const struct failover_policy *policy, const struct failover_sample *active,
+                             const struct failover_streak *streak, time_t now, long cooldown_age)
 {
-    if (!policy || !streak || policy->mode == FAILOVER_OFF ||
+    if (!policy || !active || !streak || policy->mode == FAILOVER_OFF ||
         (!json_object_array_length(policy->candidates) &&
          (!policy->subscriptions || !json_object_array_length(policy->subscriptions))) ||
-        !fresh(active, now, maximum_age) || !valid_id(active->id) ||
+        !valid_id(active->id) ||
         strcmp(active->id, streak->id) || active->checked != streak->checked || active->state != streak->latest ||
-        (last_switch && difftime(now, last_switch) < policy->cooldown_seconds) ||
+        cooldown_age < (long)policy->cooldown_seconds ||
         (policy->mode == FAILOVER_SCHEDULED && !window_open(policy, now)))
         return 0;
 
@@ -328,25 +331,44 @@ int failover_policy_ready(const struct failover_policy *policy,
     return failed || slow;
 }
 
+int failover_policy_ready(const struct failover_policy *policy,
+                const struct failover_sample *active, const struct failover_streak *streak,
+                time_t now, long maximum_age, long cooldown_age)
+{
+    return fresh(active, now, maximum_age) && switch_conditions(policy, active, streak, now, cooldown_age);
+}
+
+static int usable_candidate(const struct failover_policy *policy, const struct failover_sample *active,
+                            const struct failover_sample *candidate, time_t now, long maximum_age)
+{
+    return fresh(candidate, now, maximum_age) && valid_id(candidate->id) && strcmp(candidate->id, active->id) &&
+           failover_policy_selects(policy, candidate->id, candidate->subscription) &&
+           !failover_policy_excludes(policy, candidate->endpoint) && candidate->state == FAILOVER_OK &&
+           candidate->ms >= 0 && candidate->checked >= active->checked &&
+           (active->state != FAILOVER_OK || candidate->ms <= (long)policy->max_ms);
+}
+
+int failover_policy_confirmed(const struct failover_policy *policy, const struct failover_sample *active,
+                             const struct failover_streak *streak, const struct failover_sample *candidate,
+                             time_t confirmed_at, time_t now, long maximum_age, long cooldown_age)
+{
+    return fresh_time(confirmed_at, now, maximum_age) && switch_conditions(policy, active, streak, now, cooldown_age) &&
+           usable_candidate(policy, active, candidate, now, maximum_age) && confirmed_at >= candidate->checked;
+}
+
 const char *failover_policy_choose(const struct failover_policy *policy,
                 const struct failover_sample *active, const struct failover_streak *streak,
                 const struct failover_sample *samples, size_t count, time_t now,
-                long maximum_age, time_t last_switch)
+                long maximum_age, long cooldown_age)
 {
-    if (!samples || !failover_policy_ready(policy, active, streak, now, maximum_age, last_switch))
+    if (!samples || !failover_policy_ready(policy, active, streak, now, maximum_age, cooldown_age))
         return NULL;
 
     const struct failover_sample *best = NULL;
     for (size_t i = 0; i < count; i++) {
         const struct failover_sample *sample = &samples[i];
-        if (!valid_id(sample->id) || !strcmp(sample->id, active->id) ||
-            !failover_policy_selects(policy, sample->id, sample->subscription) ||
-            failover_policy_excludes(policy, sample->endpoint) ||
-            sample->state != FAILOVER_OK || sample->ms < 0 || !fresh(sample, now, maximum_age) ||
-            sample->checked < active->checked ||
-            (active->state == FAILOVER_OK && sample->ms > (long)policy->max_ms))
-            continue;
-        if (!best || sample->ms < best->ms) best = sample;
+        if (usable_candidate(policy, active, sample, now, maximum_age) && (!best || sample->ms < best->ms))
+            best = sample;
     }
     return best ? best->id : NULL;
 }

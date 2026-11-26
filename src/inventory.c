@@ -23,6 +23,7 @@
 
 #define RESPONSE_LIMIT (8u * 1024u * 1024u)
 #define TOKEN_LIMIT 16384
+#define TOKEN_CHARACTERS "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_."
 #define BIND_HOST_LEN (sizeof("host!") + INET6_ADDRSTRLEN + IF_NAMESIZE)
 
 struct response_body {
@@ -105,13 +106,16 @@ static int valid_url(const char *base, int loopback_only, char *bind_host)
 		struct in6_addr ipv6;
 		size_t len = strlen(host);
 		if (inet_pton(AF_INET, host, &ipv4) == 1) {
-			valid = (ntohl(ipv4.s_addr) >> 24) == 127 ||
-			        (!loopback_only && own_address(AF_INET, &ipv4, bind_host));
+			int loopback = (ntohl(ipv4.s_addr) >> 24) == 127;
+			valid = loopback || (!loopback_only && own_address(AF_INET, &ipv4, bind_host));
+			if (loopback && bind_host) snprintf(bind_host, BIND_HOST_LEN, "host!%s", host);
 		} else if (len > 2 && host[0] == '[' && host[len-1] == ']') {
 			host[len-1] = '\0';
-			if (inet_pton(AF_INET6, host + 1, &ipv6) == 1)
-				valid = IN6_IS_ADDR_LOOPBACK(&ipv6) ||
-				        (!loopback_only && own_address(AF_INET6, &ipv6, bind_host));
+			if (inet_pton(AF_INET6, host + 1, &ipv6) == 1) {
+				int loopback = IN6_IS_ADDR_LOOPBACK(&ipv6);
+				valid = loopback || (!loopback_only && own_address(AF_INET6, &ipv6, bind_host));
+				if (loopback && bind_host) snprintf(bind_host, BIND_HOST_LEN, "host!%s", host + 1);
+			}
 		}
 	}
 done:
@@ -126,14 +130,26 @@ int valid_observatory_url(const char *url)
 	return valid_url(url, 1, NULL);
 }
 
+static int valid_local_http_api(const struct v2raya_api *api)
+{
+	return api && api->base && !strncmp(api->base, "http://", sizeof("http://") - 1) &&
+	       valid_url(api->base, 0, NULL);
+}
+
 static int read_token(const char *path, char token[TOKEN_LIMIT + 2])
 {
 	token[0] = '\0';
 	if (!path || !*path)
 		return 0;
-	FILE *fp = fopen(path, "rb");
-	if (!fp)
+	int fd = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+	if (fd < 0)
 		return -1;
+	struct stat file;
+	FILE *fp = !fstat(fd, &file) && S_ISREG(file.st_mode) ? fdopen(fd, "rb") : NULL;
+	if (!fp) {
+		close(fd);
+		return -1;
+	}
 	size_t n = fread(token, 1, TOKEN_LIMIT + 1, fp);
 	int failed = ferror(fp);
 	fclose(fp);
@@ -143,10 +159,8 @@ static int read_token(const char *path, char token[TOKEN_LIMIT + 2])
 		n--;
 	if (!n)
 		return -1;
-	if (memchr(token, '\0', n))
-		return -1;
 	token[n] = '\0';
-	return 0;
+	return strspn(token, TOKEN_CHARACTERS) == n ? 0 : -1;
 }
 
 static const char *json_text(json_object *o)
@@ -167,7 +181,9 @@ static const char *field_text(json_object *obj, const char *key)
 struct api_request {
 	const char *method, *json, *query;
 	int (*permitted)(void *);
-	void *context;
+	v2raya_login_peer connected_peer;
+	void *context, *peer_context;
+	int *authorization_required;
 	int unicode_response;
 };
 
@@ -238,6 +254,18 @@ static json_object *fetch_json_request(const char *url, const char *token, const
 		snprintf(error, error_len, "cannot initialize HTTP client");
 		goto done;
 	}
+	if (request && request->connected_peer) {
+#if LIBCURL_VERSION_NUM >= 0x075000
+		if (curl_easy_setopt(curl, CURLOPT_PREREQFUNCTION, request->connected_peer) ||
+		    curl_easy_setopt(curl, CURLOPT_PREREQDATA, request->peer_context)) {
+			snprintf(error, error_len, "cannot verify the local v2rayA connection");
+			goto done;
+		}
+#else
+		snprintf(error, error_len, "this libcurl cannot verify the local v2rayA connection");
+		goto done;
+#endif
+	}
 	if (request && request->permitted && !request->permitted(request->context)) {
 		snprintf(error, error_len, "failover permission expired before switching");
 		goto done;
@@ -246,6 +274,7 @@ static json_object *fetch_json_request(const char *url, const char *token, const
 	long status = 0;
 	curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
 	if (status == 401 || status == 403) {
+		if (request && request->authorization_required) *request->authorization_required = 1;
 		snprintf(error, error_len, "authorization required (HTTP %ld)", status);
 		goto done;
 	}
@@ -304,9 +333,10 @@ static json_object *request_api(const char *base, const char *endpoint, const ch
 		// Upstream messages and bodies may contain subscription URLs.
 		const char *reason = field_text(envelope, "errorCode");
 		if ((code && !strcmp(code, "UNAUTHORIZED")) || (message && !strcmp(message, "expired token")) ||
-		    (reason && (!strcmp(reason, "SESSION_INVALID") || !strcmp(reason, "SESSION_EXPIRED"))))
+		    (reason && (!strcmp(reason, "SESSION_INVALID") || !strcmp(reason, "SESSION_EXPIRED")))) {
+			if (request && request->authorization_required) *request->authorization_required = 1;
 			snprintf(error, error_len, "v2rayA authorization required");
-		else
+		} else
 			snprintf(error, error_len, "v2rayA %s response unavailable or busy", endpoint);
 		json_object_put(envelope);
 		return NULL;
@@ -331,12 +361,6 @@ static json_object *request_data(const char *base, const char *endpoint, const c
 	return result;
 }
 
-static json_object *get_data(const char *base, const char *endpoint, const char *token,
-                             long timeout_ms, char *error, size_t error_len)
-{
-	return request_data(base, endpoint, token, NULL, timeout_ms, error, error_len);
-}
-
 static json_object *client_data(const struct v2raya_api *api, const char *endpoint, int needs_token,
                                const struct api_request *request, char *error, size_t len)
 {
@@ -348,6 +372,13 @@ static json_object *client_data(const struct v2raya_api *api, const char *endpoi
 	if (needs_token && read_token(api->token_file, token)) {
 		snprintf(error, len, "cannot read v2rayA authorization token");
 		return NULL;
+	}
+	struct api_request guarded;
+	if (api->connected_peer && (!request || !request->connected_peer)) {
+		guarded = request ? *request : (struct api_request){0};
+		guarded.connected_peer = api->connected_peer;
+		guarded.peer_context = api->peer_context;
+		request = &guarded;
 	}
 	return request_data(api->base, endpoint, token, request, api->timeout_ms, error, len);
 }
@@ -364,6 +395,49 @@ static char *copy_api_field(json_object *data, const char *endpoint, const char 
 	}
 	json_object_put(data);
 	return copy;
+}
+
+char *v2raya_api_login_token(const struct v2raya_api *api, const char *username, const char *password,
+                            v2raya_login_peer peer, void *context, char *error, size_t len)
+{
+	if (!peer || !valid_local_http_api(api) || !username || !password ||
+	    api->timeout_ms <= 0) return NULL;
+
+	json_object *body = json_object_new_object(), *user = json_object_new_string(username);
+	json_object *secret = json_object_new_string(password);
+	if (!body || !user || !secret) {
+		json_object_put(body);
+		json_object_put(user);
+		json_object_put(secret);
+		return NULL;
+	}
+	json_object_object_add(body, "username", user);
+	json_object_object_add(body, "password", secret);
+	const char *payload = json_object_to_json_string_ext(body, JSON_C_TO_STRING_PLAIN);
+	struct api_request login = {.method = "POST", .json = payload,
+	                            .connected_peer = peer, .peer_context = context};
+	json_object *reply = payload ? request_data(api->base, "login", NULL, &login, api->timeout_ms,
+	                                          error, len) : NULL;
+	json_object_put(body);
+	char *token = copy_api_field(reply, "login", "token", error, len);
+	if (!token) return NULL;
+
+	const char *first = strchr(token, '.'), *second = first ? strchr(first + 1, '.') : NULL;
+	size_t length = strlen(token);
+	if (length <= TOKEN_LIMIT && first && first > token && second && second > first + 1 &&
+	    second[1] && !strchr(second + 1, '.') &&
+	    strspn(token, TOKEN_CHARACTERS) == length) {
+		const struct api_request validation = {.connected_peer = peer, .peer_context = context};
+		json_object *touch = request_data(api->base, "touch", token, &validation, api->timeout_ms, error, len);
+		if (touch) {
+			json_object_put(touch);
+			return token;
+		}
+	} else {
+		snprintf(error, len, "invalid v2rayA login token");
+	}
+	free(token);
+	return NULL;
 }
 
 char *v2raya_api_get_version(const struct v2raya_api *api, char *error, size_t len)
@@ -387,6 +461,35 @@ json_object *v2raya_api_version_data(const struct v2raya_api *api, char *error, 
 json_object *v2raya_api_touch_data(const struct v2raya_api *api, char *error, size_t len)
 {
 	return client_data(api, "touch", 1, NULL, error, len);
+}
+
+json_object *v2raya_api_setting_data(const struct v2raya_api *api, char *error, size_t len)
+{
+	return client_data(api, "setting", 1, NULL, error, len);
+}
+
+int v2raya_api_core_port_automatic(const struct v2raya_api *api, v2raya_login_peer peer,
+                                   void *context, char *error, size_t len)
+{
+	const struct api_request request = {.connected_peer = peer, .peer_context = context};
+	json_object *data = client_data(api, "ports", 1, &request, error, len);
+	json_object *definition = json_object_object_get(data, "api");
+	json_object *port = json_object_object_get(definition, "port");
+	int automatic = json_object_is_type(port, json_type_int) && json_object_get_int64(port) == 0;
+	json_object_put(data);
+	return automatic;
+}
+
+int v2raya_api_port_sharing(const struct v2raya_api *api, v2raya_login_peer peer,
+                            void *context, char *error, size_t len)
+{
+	const struct api_request request = {.connected_peer = peer, .peer_context = context};
+	json_object *data = client_data(api, "setting", 1, &request, error, len);
+	json_object *setting = json_object_object_get(data, "setting");
+	json_object *sharing = json_object_object_get(setting, "portSharing");
+	int result = json_object_is_type(sharing, json_type_boolean) ? json_object_get_boolean(sharing) : -1;
+	json_object_put(data);
+	return result;
 }
 
 char *v2raya_api_export_node(const struct v2raya_api *api, json_object *which, char *error, size_t len)
@@ -422,6 +525,20 @@ json_object *v2raya_api_connect_node(const struct v2raya_api *api, json_object *
 	}
 	struct api_request request = {.method = "POST", .json = json, .permitted = permitted, .context = context};
 	return client_data(api, "connection", 1, &request, error, len);
+}
+
+int v2raya_api_start_core(const struct v2raya_api *api, v2raya_login_peer permitted, void *context,
+                         char *error, size_t len)
+{
+	/* The recovery guard verifies the connected owner before authorizing the POST. */
+	if (!permitted || !valid_local_http_api(api) || !api->token_file ||
+	    !*api->token_file) return -1;
+	struct api_request request = {.method = "POST", .json = "{}", .connected_peer = permitted,
+	                              .peer_context = context};
+	json_object *reply = client_data(api, "v2ray", 1, &request, error, len);
+	if (!reply) return -1;
+	json_object_put(reply);
+	return 0;
 }
 
 int v2raya_api_save_routing(const struct v2raya_api *api, const char *expected_original,
@@ -785,25 +902,28 @@ static void refine_xhttp(struct inventory *inv, const char *path)
 	json_object_put(core);
 }
 
-int load_inventory(const char *api, const char *token_file, const char *xray_config, long timeout_ms,
+int load_inventory(const struct v2raya_api *api, const char *xray_config,
                    struct inventory *out, char *error, size_t error_len)
 {
 	*out = (struct inventory){0};
-	if (!valid_url(api, 0, NULL) || timeout_ms <= 0) {
+	if (!api || !valid_url(api->base, 0, NULL) || api->timeout_ms <= 0) {
 		snprintf(error, error_len, "invalid v2rayA URL or timeout; use HTTPS or this router's numeric HTTP IP");
 		return -1;
 	}
 	char token[TOKEN_LIMIT + 2];
-	if (read_token(token_file, token)) {
+	if (read_token(api->token_file, token)) {
 		snprintf(error, error_len, "cannot read v2rayA authorization token");
-		return -1;
+		return INVENTORY_AUTH_REQUIRED;
 	}
 	int rc = -1;
+	int authorization_required = 0;
+	const struct api_request discovery = {.authorization_required = &authorization_required,
+		.connected_peer = api->connected_peer, .peer_context = api->peer_context};
 	json_object *names = NULL, *touch = NULL;
-	names = get_data(api, "outbounds", token, timeout_ms, error, error_len);
+	names = request_data(api->base, "outbounds", token, &discovery, api->timeout_ms, error, error_len);
 	if (!names)
 		goto done;
-	touch = get_data(api, "touch", token, timeout_ms, error, error_len);
+	touch = request_data(api->base, "touch", token, &discovery, api->timeout_ms, error, error_len);
 	if (!touch)
 		goto done;
 	if (parse_inventory(names, touch, out)) {
@@ -817,5 +937,5 @@ int load_inventory(const char *api, const char *token_file, const char *xray_con
 done:
 	json_object_put(names);
 	json_object_put(touch);
-	return rc;
+	return authorization_required ? INVENTORY_AUTH_REQUIRED : rc;
 }

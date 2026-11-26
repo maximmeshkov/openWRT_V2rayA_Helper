@@ -1,0 +1,428 @@
+#!/bin/sh
+
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH LC_ALL=C
+umask 077
+
+RUN=/var/run/v2raya-helper-geodata
+BACKUP=/root/geo-backup
+OWN="$BACKUP/v2raya-helper"
+STATE="$RUN/geodata.state"
+LOCK="$OWN/job.lock"
+V2RAY=/usr/share/v2ray
+XRAY_ASSETS=/usr/share/xray
+ASSETS=/run/user/0/v2raya
+CONFIG=/etc/v2raya/config.json
+XRAY=/usr/bin/xray
+HELPER=/usr/bin/v2raya-helper
+FLOCK=/usr/bin/flock
+PROXY=http://127.0.0.1:20171
+REQUIRED='geoip.dat geosite.dat russia-geosite.dat russia-geoip.dat'
+OPTIONAL=itdog-geosite.dat
+MAX_FILE_SIZE=201326592
+
+safe_path() {
+	local result
+	[ ! -L "$1" ] || return 1
+	result=$(find "$1" -maxdepth 0 -user 0 ! -perm "/$2" -print) || return 1
+	[ "$result" = "$1" ]
+}
+
+safe_dir() { [ -d "$1" ] && safe_path "$1" "$2"; }
+managed_file() { [ -f "$1" ] && safe_path "$1" 022; }
+safe_file() { [ -s "$1" ] && managed_file "$1"; }
+entry_exists() { [ -e "$1" ] || [ -L "$1" ]; }
+
+private_dir() {
+	if ! entry_exists "$1"; then
+		mkdir -m 700 "$1" 2>/dev/null || [ -d "$1" ] || return 1
+	fi
+	safe_dir "$1" 077
+}
+
+message_for() {
+	case "$1" in
+		busy) echo 'A geodata operation is already running.' ;;
+		started) echo 'Geodata operation in progress.' ;;
+		updated) echo 'Updated and validated. The files take effect the next time Xray loads its configuration.' ;;
+		optional) echo 'Updated and validated. The existing ITDOG file was left as it was.' ;;
+		restored) echo 'Restored and validated. The files take effect the next time Xray loads its configuration.' ;;
+		same) echo 'The validated files are already installed.' ;;
+		setup) echo 'The geodata paths, runtime, or required tools are unavailable.' ;;
+		download) echo 'A required download failed or returned an invalid file.' ;;
+		backup) echo 'A complete readable geodata backup is unavailable.' ;;
+		validate) echo 'The staged geodata did not pass Xray validation.' ;;
+		changed) echo 'The running configuration or data files changed during the operation. Try again.' ;;
+		write) echo 'Publishing failed. Any completed replacements were rolled back.' ;;
+		rollback) echo 'Publishing and automatic rollback failed. Check the saved geodata backup.' ;;
+		interrupted) echo 'The previous geodata operation ended before completion.' ;;
+		*) echo 'Choose Update or Restore.' ;;
+	esac
+}
+
+write_state() {
+	local state_tmp
+	safe_dir "$RUN" 077 || return 1
+	state_tmp=$(mktemp "$RUN/.geodata.XXXXXX") || return 1
+	if ! printf '%s %s %s\n' "$1" "$2" "$3" > "$state_tmp" || ! mv -f "$state_tmp" "$STATE"; then
+		rm -f "$state_tmp"
+		return 1
+	fi
+}
+
+backup_location() {
+	local id name complete
+	if safe_dir "$OWN" 077 && safe_file "$OWN/current" && [ "$(wc -c < "$OWN/current")" -le 32 ]; then
+		IFS= read -r id < "$OWN/current"
+		case "$id" in
+			*[!A-Za-z0-9.]*) ;;
+			snapshot.??????)
+				if safe_dir "$OWN/$id" 077; then
+					complete=1
+					for name in $REQUIRED; do
+						if ! safe_file "$OWN/$id/$name"; then complete=0; break; fi
+					done
+					if [ "$complete" = 1 ]; then printf '%s\n' "$OWN/$id"; return 0; fi
+				fi ;;
+		esac
+	fi
+	safe_dir "$BACKUP" 022 || return 1
+	for name in $REQUIRED; do safe_file "$BACKUP/$name.working" || return 1; done
+	printf '%s\n' "$BACKUP"
+}
+
+read_state() {
+	if safe_dir "$RUN" 077 && safe_file "$STATE" && [ "$(wc -c < "$STATE")" -le 128 ]; then
+		read -r state action detail < "$STATE"
+	fi
+	case "$state" in running|ok|error) ;; *) state=idle; detail=idle ;; esac
+}
+
+status() {
+	local state=idle action= detail=idle can_restore=false
+	read_state
+	if safe_dir "$OWN" 077 && [ -f "$LOCK" ] && safe_path "$LOCK" 077 && [ -x "$FLOCK" ]; then
+		if ! (exec 8< "$LOCK"; "$FLOCK" -n 8); then
+			state=running; detail=started
+		elif [ "$state" = running ]; then
+			read_state
+			if [ "$state" = running ]; then state=error; detail=interrupted; fi
+		fi
+	elif [ "$state" = running ]; then
+		state=error; detail=interrupted
+	fi
+	if backup_location >/dev/null 2>&1; then can_restore=true; fi
+	printf '{"state":"%s","message":"%s","can_restore":%s' "$state" "$(message_for "$detail")" "$can_restore"
+	case "$action" in update|restore) printf ',"action":"%s"' "$action" ;; esac
+	printf '}\n'
+}
+
+live_path() {
+	case "$1" in geoip.dat|geosite.dat) printf '%s/%s\n' "$V2RAY" "$1" ;;
+		*) printf '%s/%s\n' "$XRAY_ASSETS" "$1" ;;
+	esac
+}
+
+vendor_urls() {
+	case "$1" in
+		geoip.dat)
+			primary=https://github.com/v2fly/geoip/releases/latest/download/geoip.dat
+			fallback=https://cdn.jsdelivr.net/gh/v2fly/geoip@release/geoip.dat ;;
+		geosite.dat)
+			primary=https://github.com/v2fly/domain-list-community/releases/latest/download/dlc.dat
+			fallback=https://cdn.jsdelivr.net/gh/v2fly/domain-list-community@release/dlc.dat ;;
+		russia-geosite.dat)
+			primary=https://raw.githubusercontent.com/runetfreedom/russia-v2ray-rules-dat/release/geosite.dat
+			fallback= ;;
+		russia-geoip.dat)
+			primary=https://raw.githubusercontent.com/runetfreedom/russia-v2ray-rules-dat/release/geoip.dat
+			fallback=https://cdn.jsdelivr.net/gh/runetfreedom/russia-v2ray-rules-dat@release/geoip.dat ;;
+		itdog-geosite.dat)
+			primary=https://github.com/itdoginfo/allow-domains/releases/latest/download/geosite.dat
+			fallback=https://cdn.jsdelivr.net/gh/itdoginfo/allow-domains@release/geosite.dat ;;
+	esac
+}
+
+binary_data() {
+	local size
+	[ -s "$1" ] || return 1
+	size=$(wc -c < "$1") || return 1
+	[ "$size" -ge "$2" ] && [ "$size" -le "${3-$MAX_FILE_SIZE}" ] || return 1
+	! head -c 256 "$1" | grep -Eiq '^[[:space:]]*(<!doctype|<html|<\?xml|404:|not found|access denied|\{"message")'
+}
+
+download_source() {
+	local url="$1" out="$2" minimum="$3" maximum="$4" try=1
+	shift 4
+	[ -n "$url" ] || return 1
+	while [ "$try" -le 5 ]; do
+		rm -f "$out.part"
+		if (ulimit -f 393216 && curl -q -fsSL --proto '=https' --proto-redir '=https' \
+			--connect-timeout 15 --max-time 60 --max-filesize "$maximum" \
+			"$@" --output "$out.part" "$url") && binary_data "$out.part" "$minimum" "$maximum"; then
+			mv -f "$out.part" "$out"
+			return $?
+		fi
+		[ "$try" -eq 5 ] || sleep 2
+		try=$((try + 1))
+	done
+	rm -f "$out.part"
+	return 1
+}
+
+download() {
+	local name="$1" out="$2" primary fallback minimum=30000 maximum="$MAX_FILE_SIZE" old_size
+	vendor_urls "$name"
+	if [ -f "$WORK/old/$name" ]; then
+		old_size=$(wc -c < "$WORK/old/$name") || return 1
+		minimum=1024
+		if [ "$((old_size / 2))" -gt "$minimum" ]; then minimum=$((old_size / 2)); fi
+		if [ "$((old_size * 3))" -lt "$maximum" ]; then maximum=$((old_size * 3)); fi
+	fi
+	download_source "$primary" "$out" "$minimum" "$maximum" --noproxy '*' ||
+		download_source "$fallback" "$out" "$minimum" "$maximum" --noproxy '*' ||
+		{ awk '$4 == "0A" && ($2 == "0100007F:4ECB" || $2 == "00000000:4ECB") { found=1 } END { exit !found }' /proc/net/tcp &&
+		  { download_source "$primary" "$out" "$minimum" "$maximum" --proxy "$PROXY" --noproxy '' ||
+		    download_source "$fallback" "$out" "$minimum" "$maximum" --proxy "$PROXY" --noproxy ''; }; }
+}
+
+xray_test() {
+	"$HELPER" geodata-validate "$XRAY" "$STAGE"
+}
+
+test_tags() {
+	local field="$1" asset="$2" tag separator=
+	shift 2
+	{
+		printf '%s' '{"log":{"loglevel":"none"},"outbounds":[{"protocol":"blackhole","tag":"test"}],"routing":{"rules":[{"type":"field","outboundTag":"test",'
+		printf '"%s":[' "$field"
+		for tag in "$@"; do printf '%s"ext:%s:%s"' "$separator" "$asset" "$tag"; separator=,; done
+		printf '%s\n' ']}]}}'
+	} | xray_test
+}
+
+preflight() {
+	local name path entry
+	[ -x "$XRAY" ] && [ -x "$HELPER" ] && command -v jsonfilter >/dev/null || return 1
+	safe_dir "$V2RAY" 022 && safe_dir "$XRAY_ASSETS" 022 && safe_dir "$ASSETS" 022 && safe_file "$CONFIG" || return 1
+	cp "$CONFIG" "$WORK/config.json" || return 1
+	jsonfilter -i "$WORK/config.json" -e '@' >/dev/null 2>&1 || return 1
+	# Xray constructs the logger even in test mode. Keep validation away from live log files.
+	for name in access error; do
+		entry=$(jsonfilter -i "$WORK/config.json" -e "@.log.$name" 2>/dev/null)
+		case "$entry" in ''|none) ;; *) return 1 ;; esac
+	done
+	for name in $REQUIRED "$OPTIONAL"; do
+		path=$(live_path "$name")
+		if ! entry_exists "$path"; then
+			[ "$action" = restore ] || [ "$name" = "$OPTIONAL" ] || return 1
+			if entry_exists "$ASSETS/$name"; then [ "$(readlink -f "$ASSETS/$name")" = "$path" ] || return 1; fi
+			continue
+		fi
+		managed_file "$path" && [ "$(readlink -f "$ASSETS/$name")" = "$path" ] || return 1
+		[ "$action" = restore ] || [ -s "$path" ] || return 1
+		cp -p "$path" "$WORK/old/$name" || return 1
+	done
+	for name in geoip.dat geosite.dat; do
+		[ "$(readlink -f "$XRAY_ASSETS/$name")" = "$V2RAY/$name" ] || return 1
+	done
+	for path in "$ASSETS"/*; do
+		[ -f "$path" ] || continue
+		name=${path##*/}
+		case " $REQUIRED $OPTIONAL " in *" $name "*) continue ;; esac
+		ln -s "$path" "$STAGE/$name" || return 1
+	done
+}
+
+copy_backup() {
+	local source="$1" name file suffix=
+	[ "$source" != "$BACKUP" ] || suffix=.working
+	for name in $REQUIRED "$OPTIONAL"; do
+		file="$source/$name$suffix"
+		if [ "$name" = "$OPTIONAL" ] && ! safe_file "$file"; then continue; fi
+		safe_file "$file" && binary_data "$file" 1 && cp "$file" "$STAGE/$name" || return 1
+	done
+}
+
+keep_optional() {
+	rm -f "$STAGE/$OPTIONAL" || return 1
+	optional_kept=1
+	if [ -f "$WORK/old/$OPTIONAL" ]; then
+		ln -s "$WORK/old/$OPTIONAL" "$STAGE/$OPTIONAL" || return 1
+	fi
+}
+
+validate_stage() {
+	test_tags ip geoip.dat private && test_tags domain geosite.dat google &&
+		test_tags ip russia-geoip.dat google telegram &&
+		test_tags domain russia-geosite.dat category-ai-!cn category-porn ru-available-only-inside ru-blocked || return 1
+	if [ -f "$STAGE/$OPTIONAL" ] && ! test_tags domain "$OPTIONAL" russia-inside russia-outside \
+		russia-inside@block russia-inside@geoblock russia-inside@porn russia-inside@discord \
+		russia-inside@youtube russia-inside@tiktok russia-inside@twitter russia-inside@hodca; then
+		keep_optional || return 1
+	fi
+	if [ ! -f "$STAGE/$OPTIONAL" ] && [ -f "$WORK/old/$OPTIONAL" ]; then
+		keep_optional || return 1
+	fi
+	xray_test < "$WORK/config.json" && return 0
+	[ -f "$STAGE/$OPTIONAL" ] && [ ! -L "$STAGE/$OPTIONAL" ] &&
+		keep_optional && xray_test < "$WORK/config.json"
+}
+
+matches_original() {
+	if [ -f "$WORK/old/$1" ]; then
+		managed_file "$2" && cmp -s "$WORK/old/$1" "$2"
+	else
+		! entry_exists "$2"
+	fi
+}
+
+prepare_changes() {
+	local name path temp old
+	for name in $REQUIRED "$OPTIONAL"; do
+		[ -f "$STAGE/$name" ] || continue
+		path=$(live_path "$name")
+		matches_original "$name" "$path" || { detail=changed; return 1; }
+		if cmp -s "$STAGE/$name" "$WORK/old/$name"; then continue; fi
+		temp=$(mktemp "${path%/*}/.v2raya-geo-new.XXXXXX") || return 1
+		printf '%s\n' "$temp" > "$WORK/new.$name" || { rm -f "$temp"; return 1; }
+		if [ -f "$WORK/old/$name" ]; then
+			old=$(mktemp "${path%/*}/.v2raya-geo-old.XXXXXX") || return 1
+			printf '%s\n' "$old" > "$WORK/rollback.$name" || { rm -f "$old"; return 1; }
+			cp -p "$WORK/old/$name" "$old" && cp -p "$old" "$temp" || return 1
+		else
+			chmod 644 "$temp" || return 1
+		fi
+		cat "$STAGE/$name" > "$temp" || return 1
+		changes="$changes $name"
+	done
+}
+
+save_backup() {
+	local name
+	previous_backup=$(backup_location)
+	new_backup=$(mktemp -d "$OWN/snapshot.XXXXXX") || return 1
+	for name in $REQUIRED "$OPTIONAL"; do
+		[ ! -f "$WORK/old/$name" ] || cp -p "$WORK/old/$name" "$new_backup/$name" || return 1
+	done
+}
+
+publish_backup() {
+	local pointer
+	pointer=$(mktemp "$OWN/.current.XXXXXX") || return 1
+	if ! printf '%s\n' "${new_backup##*/}" > "$pointer" || ! mv -f "$pointer" "$OWN/current"; then
+		rm -f "$pointer"
+		return 1
+	fi
+}
+
+remove_backup() {
+	local name
+	for name in $REQUIRED "$OPTIONAL"; do rm -f "$1/$name"; done
+	rmdir "$1" 2>/dev/null || :
+}
+
+rollback() {
+	local name path old complete=0
+	for name in $installed; do
+		path=$(live_path "$name")
+		if matches_original "$name" "$path"; then continue; fi
+		if ! safe_file "$path" || ! cmp -s "$path" "$STAGE/$name"; then complete=1; continue; fi
+		if [ -f "$WORK/rollback.$name" ]; then
+			read -r old < "$WORK/rollback.$name"
+			mv -f "$old" "$path" || complete=1
+		else
+			rm -f "$path" || complete=1
+		fi
+	done
+	return "$complete"
+}
+
+finish() {
+	local file name current
+	trap - EXIT HUP INT TERM
+	if [ "$state" = ok ]; then
+		case "$previous_backup" in "$OWN"/snapshot.??????) remove_backup "$previous_backup" ;; esac
+	elif ! rollback; then
+		detail=rollback
+		if [ -n "$new_backup" ]; then publish_backup || :; fi
+	elif [ -n "$new_backup" ]; then
+		if safe_file "$OWN/current"; then IFS= read -r current < "$OWN/current"; fi
+		if [ "$current" != "${new_backup##*/}" ]; then remove_backup "$new_backup"; fi
+	fi
+	if [ -n "$WORK" ]; then
+		for name in $REQUIRED "$OPTIONAL"; do
+			for file in "$WORK/new.$name" "$WORK/rollback.$name"; do
+				if [ -f "$file" ]; then read -r file < "$file"; rm -f "$file"; fi
+			done
+		done
+		rm -rf "$WORK"
+	fi
+	write_state "$state" "$action" "$detail"
+}
+
+worker() {
+	action="$1"; state=error; detail=setup; installed=; changes=; new_backup=; previous_backup=; optional_kept=0; WORK=
+	local name source path temp
+	trap finish EXIT
+	trap 'detail=interrupted; exit 1' HUP INT TERM
+	WORK=$(mktemp -d /tmp/v2raya-helper-geo.XXXXXX) || exit 1
+	STAGE="$WORK/assets"
+	mkdir "$STAGE" "$WORK/old" && preflight || exit 1
+	if [ "$action" = update ]; then
+		detail=download
+		for name in $REQUIRED; do download "$name" "$STAGE/$name" || exit 1; done
+		if ! download "$OPTIONAL" "$STAGE/$OPTIONAL"; then optional_kept=1; fi
+	else
+		detail=backup
+		source=$(backup_location) && copy_backup "$source" || exit 1
+	fi
+	detail=validate
+	validate_stage || exit 1
+	detail=write
+	prepare_changes || exit 1
+	if [ -n "$changes" ]; then
+		cmp -s "$CONFIG" "$WORK/config.json" || { detail=changed; exit 1; }
+		if [ "$action" = update ]; then save_backup || exit 1; fi
+		for name in $changes; do
+			path=$(live_path "$name")
+			matches_original "$name" "$path" && cmp -s "$CONFIG" "$WORK/config.json" || { detail=changed; exit 1; }
+			read -r temp < "$WORK/new.$name"
+			installed="$name $installed"
+			mv -f "$temp" "$path" || exit 1
+		done
+		if [ "$action" = update ]; then publish_backup || exit 1; fi
+	fi
+	state=ok
+	if [ -z "$changes" ]; then detail=same
+	elif [ "$action" = restore ]; then detail=restored
+	elif [ "$optional_kept" -eq 1 ]; then detail=optional
+	else detail=updated; fi
+	exit 0
+}
+
+start() {
+	local action="$1"
+	if ! safe_dir "$(readlink -f /var/run)" 022 || ! private_dir "$RUN" ||
+	   ! safe_dir /root 022 || ! { safe_dir "$BACKUP" 022 || private_dir "$BACKUP"; } ||
+	   ! private_dir "$OWN" || [ ! -x "$FLOCK" ] ||
+	   { entry_exists "$LOCK" && { [ ! -f "$LOCK" ] || ! safe_path "$LOCK" 077; }; }; then
+		printf '{"ok":false,"error":"%s"}\n' "$(message_for setup)"
+		return
+	fi
+	exec 9>> "$LOCK" || exit 1
+	if ! "$FLOCK" -n 9; then
+		printf '{"ok":false,"error":"%s"}\n' "$(message_for busy)"
+	elif ! write_state running "$action" started; then
+		printf '{"ok":false,"error":"%s"}\n' "$(message_for setup)"
+	else
+		(worker "$action") </dev/null >/dev/null 2>&1 &
+		printf '%s\n' '{"ok":true}'
+	fi
+}
+
+case "${1-}" in
+	status) status ;;
+	start) case "${2-}" in update|restore) start "$2" ;; *) printf '%s\n' '{"ok":false,"error":"Invalid geodata operation."}' ;; esac ;;
+	*) exit 2 ;;
+esac

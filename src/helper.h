@@ -40,13 +40,16 @@ struct inventory {
     size_t count;
 };
 
-int load_inventory(const char *api, const char *token_file, const char *xray_config, long timeout_ms,
+enum { INVENTORY_AUTH_REQUIRED = -2 };
+
+struct v2raya_api;
+int load_inventory(const struct v2raya_api *api, const char *xray_config,
                    struct inventory *out, char *error, size_t error_len);
 void free_inventory(struct inventory *inv);
 json_object *fetch_json(const char *url, const char *token, long timeout_ms,
                         char *error, size_t error_len);
 struct probe_job {
-    struct outbound *out;
+    const struct outbound *out;
     struct member *member;
 };
 struct https_options {

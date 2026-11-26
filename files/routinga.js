@@ -1,6 +1,7 @@
 'use strict';
 'require view';
 'require rpc';
+'require v2raya-helper.menu as helperMenu';
 
 var ruleParams = ['kind', 'value', 'outbound', 'before_line', 'revision'];
 var readContext = rpc.declare({
@@ -24,10 +25,10 @@ var saveRule = rpc.declare({
 	reject: true
 });
 
-function formRow(label, control) {
+function formRow(label, control, help) {
 	return E('div', { 'class': 'cbi-value' }, [
 		E('label', { 'class': 'cbi-value-title', 'for': control.id }, [label]),
-		E('div', { 'class': 'cbi-value-field' }, [control])
+		E('div', { 'class': 'cbi-value-field' }, help ? [control, help] : [control])
 	]);
 }
 
@@ -60,6 +61,7 @@ return view.extend({
 	handleReset: null,
 
 	load: function() {
+		helperMenu.refresh();
 		return readContext().catch(function() { return {}; });
 	},
 
@@ -68,18 +70,52 @@ return view.extend({
 		var preview = null;
 		var busy = false;
 		var canWrite = L.hasViewPermission() === true;
-		var kind = E('select', { 'id': 'routinga-kind', 'class': 'cbi-input-select' }, [
-			option('domain', _('Domain and subdomains')),
-			option('contains', _('Domain contains')),
-			option('full', _('Exact domain')),
-			option('ip', _('IP address or CIDR')),
-			option('regexp', _('Domain regular expression')),
-			option('geosite', _('Geosite domain list')),
-			option('geoip', _('GeoIP address list'))
-		]);
+		var matchTypes = {
+			domain: {
+				label: _('Domain and subdomains'),
+				example: 'example.org',
+				help: _('Matches the host you enter and its subdomains. If you paste a URL, the form uses its host name.')
+			},
+			contains: {
+				label: _('Domain contains'),
+				example: 'example',
+				help: _('Matches the text anywhere in a host name.')
+			},
+			full: {
+				label: _('Exact domain'),
+				example: 'www.example.org',
+				help: _('Matches exactly one host name. Use the complete name, including any subdomain.')
+			},
+			ip: {
+				label: _('IP address or CIDR'),
+				example: '203.0.113.0/24',
+				help: _('Enter one IPv4 or IPv6 address, or a network in CIDR notation.')
+			},
+			regexp: {
+				label: _('Domain regular expression'),
+				example: '(^|\\.)example\\.org$',
+				help: _('Use a pattern for the host name. This example matches example.org and its subdomains.')
+			},
+			geosite: {
+				label: _('Geosite domain list'),
+				example: 'google',
+				help: _('Enter only the name of a domain list from the installed geosite.dat file.')
+			},
+			geoip: {
+				label: _('GeoIP address list'),
+				example: 'private',
+				help: _('Enter only the name of an address list from the installed geoip.dat file.')
+			}
+		};
+		var kind = E('select', { 'id': 'routinga-kind', 'class': 'cbi-input-select' },
+			Object.keys(matchTypes).map(function(value) { return option(value, matchTypes[value].label); }));
 		var address = E('input', {
 			'id': 'routinga-address', 'class': 'cbi-input-text', 'type': 'text',
+			'aria-describedby': 'routinga-address-help',
 			'required': '', 'autocomplete': 'off', 'spellcheck': 'false', 'maxlength': 2048
+		});
+		var addressHelp = E('p', {
+			'id': 'routinga-address-help', 'class': 'cbi-section-descr', 'aria-live': 'polite'
 		});
 		var outbound = E('select', { 'id': 'routinga-outbound', 'class': 'cbi-input-select', 'required': '' });
 		var positionButton = E('button', {
@@ -115,7 +151,7 @@ return view.extend({
 		var reloadButton = E('button', { 'type': 'button', 'class': 'btn cbi-button cbi-button-neutral' }, [_('Refresh')]);
 		var fields = E('fieldset', { 'class': 'cbi-section' }, [
 			formRow(_('Match type'), kind),
-			formRow(_('Address'), address),
+			formRow(_('Address'), address, addressHelp),
 			formRow(_('Outbound'), outbound),
 			E('div', { 'class': 'cbi-value' }, [
 				E('span', { 'class': 'cbi-value-title' }, [_('Insert rule')]),
@@ -251,8 +287,13 @@ return view.extend({
 		function edited() {
 			clearPreview();
 			showStatus('', false);
-			address.placeholder = kind.value === 'ip' ? '203.0.113.0/24' : 'example.org';
 			updateControls();
+		}
+
+		function updateAddressHelp() {
+			var type = matchTypes[kind.value];
+			address.placeholder = type.example;
+			addressHelp.textContent = type.help;
 		}
 
 		function handlePreview(event) {
@@ -306,7 +347,11 @@ return view.extend({
 		}
 
 		address.addEventListener('input', edited);
-		[kind, outbound].forEach(function(control) { control.addEventListener('change', edited); });
+		kind.addEventListener('change', function() {
+			updateAddressHelp();
+			edited();
+		});
+		outbound.addEventListener('change', edited);
 		positionButton.addEventListener('click', function() {
 			if (!picker.hidden) {
 				closePicker();
@@ -343,7 +388,7 @@ return view.extend({
 			}, _('Could not load RoutingA from v2rayA.'));
 		});
 
-		address.placeholder = 'example.org';
+		updateAddressHelp();
 		populate(initialContext);
 		return E('div', { 'class': 'cbi-map' }, [
 			E('h2', {}, [_('RoutingA')]),

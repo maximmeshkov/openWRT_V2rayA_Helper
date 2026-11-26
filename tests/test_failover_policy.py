@@ -63,6 +63,8 @@ class FailoverPolicyTest(unittest.TestCase):
         cls.lib.failover_policy_ready.restype = C.c_int
         cls.lib.failover_policy_choose.argtypes = inputs + [C.POINTER(Sample), C.c_size_t] + timing
         cls.lib.failover_policy_choose.restype = C.c_char_p
+        cls.lib.failover_policy_confirmed.argtypes = inputs + [C.POINTER(Sample), C.c_long] + timing
+        cls.lib.failover_policy_confirmed.restype = C.c_int
 
     def setUp(self):
         previous = os.environ.get("TZ")
@@ -94,13 +96,17 @@ class FailoverPolicyTest(unittest.TestCase):
     def record(self, p, streak, sample, now=NOW):
         self.lib.failover_record(C.byref(streak), C.byref(p), C.byref(sample), now, 120)
 
-    def ready(self, p, streak, sample, now=NOW, last=0):
-        return self.lib.failover_policy_ready(C.byref(p), C.byref(sample), C.byref(streak), now, 120, last)
+    def ready(self, p, streak, sample, now=NOW, age=86400):
+        return self.lib.failover_policy_ready(C.byref(p), C.byref(sample), C.byref(streak), now, 120, age)
 
-    def chosen(self, p, streak, sample, *candidates, now=NOW, last=0):
+    def chosen(self, p, streak, sample, *candidates, now=NOW, age=86400):
         return self.lib.failover_policy_choose(C.byref(p), C.byref(sample), C.byref(streak),
                                                (Sample * len(candidates))(*candidates), len(candidates),
-                                               now, 120, last)
+                                               now, 120, age)
+
+    def confirmed(self, p, streak, active, reserve, checked, now, maximum_age=4, cooldown=86400):
+        return self.lib.failover_policy_confirmed(C.byref(p), C.byref(active), C.byref(streak), C.byref(reserve),
+                                                  checked, now, maximum_age, cooldown)
 
     def streak(self, p, state=FAILED, ms=0, now=NOW):
         streak = Streak()
@@ -133,6 +139,45 @@ class FailoverPolicyTest(unittest.TestCase):
         self.assertFalse(self.ready(p, streak, failure))
         self.record(p, streak, Sample(b"new-main", FAILED, 0, NOW))
         self.assertEqual(streak.failed, 1)
+
+    def test_waiting_in_queue_keeps_consecutive_failures_but_requires_a_fresh_result(self):
+        p = self.policy()
+        streak = Streak()
+        sample = Sample(b"main", FAILED, 0, NOW)
+        self.record(p, streak, sample)
+        for previous_count in (1, 2):
+            later = sample.checked + 150
+            self.record(p, streak, sample, later)
+            self.assertEqual(streak.failed, previous_count)
+            self.assertFalse(self.ready(p, streak, sample, now=later))
+            sample = Sample(b"main", FAILED, 0, later)
+            self.record(p, streak, sample, later)
+        self.assertTrue(self.ready(p, streak, sample, now=sample.checked))
+        self.assertFalse(self.ready(p, streak, sample, now=sample.checked + 150))
+        self.record(p, streak, Sample(b"main", UNKNOWN, 0, sample.checked + 151), sample.checked + 151)
+        self.assertEqual(streak.failed, 0)
+
+    def test_fresh_confirmation_allows_attempt_after_original_result_ages(self):
+        p = self.policy()
+        streak, active = self.streak(p)
+        reserve = Sample(b"preferred", OK, 3000, NOW + 3)
+        self.assertTrue(self.confirmed(p, streak, active, reserve, NOW + 6, NOW + 6))
+        self.assertFalse(self.confirmed(p, streak, active, reserve, NOW + 2, NOW + 6))
+        self.assertFalse(self.confirmed(p, streak, active, reserve, NOW + 6, NOW + 8))
+        self.assertFalse(self.confirmed(p, streak, active, reserve, NOW + 7, NOW + 6))
+        self.assertFalse(self.confirmed(p, streak, active, reserve, NOW + 6, NOW + 6, cooldown=15))
+        self.assertEqual((streak.failed, streak.checked), (3, NOW))
+
+    def test_confirmation_does_not_extend_a_configured_failure_window(self):
+        p = self.policy(failure_method="window", failure_window_minutes=1)
+        streak = Streak()
+        for offset in (58, 29, 0):
+            active = Sample(b"main", FAILED, 0, NOW - offset)
+            self.record(p, streak, active, NOW - offset)
+        reserve = Sample(b"preferred", OK, 3000, NOW + 1)
+        self.assertTrue(self.confirmed(p, streak, active, reserve, NOW + 2, NOW + 2))
+        self.assertFalse(self.confirmed(p, streak, active, reserve, NOW + 3, NOW + 3))
+        self.assertEqual(streak.window_count, 3)
 
     def test_rolling_window_counts_distinct_failures_with_recoveries(self):
         p = self.policy(failure_method="window", failure_window_minutes=3)
@@ -219,8 +264,8 @@ class FailoverPolicyTest(unittest.TestCase):
         p = self.policy(mode="scheduled", start="23:00", end="06:00", max_ms=300)
         streak, active = self.streak(p, OK, 420)
         self.assertTrue(self.ready(p, streak, active))
-        self.assertFalse(self.ready(p, streak, active, last=NOW - 5))
-        self.assertTrue(self.ready(p, streak, active, last=NOW - 900))
+        self.assertFalse(self.ready(p, streak, active, age=5))
+        self.assertTrue(self.ready(p, streak, active, age=900))
         self.assertIsNone(self.chosen(p, streak, active, Sample(b"preferred", OK, 320, NOW)))
         self.assertEqual(self.chosen(p, streak, active, Sample(b"preferred", OK, 250, NOW)), b"preferred")
 

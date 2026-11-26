@@ -1,6 +1,7 @@
 """Follow v2rayA's positional references through changes to the server catalogue."""
 import json
 import os
+from pathlib import Path
 import subprocess
 import time
 from socketserver import ThreadingTCPServer
@@ -408,6 +409,31 @@ class CatalogueLifecycle(NodeFixture):
     def test_qualified_outbound_restarts_streak_if_its_core_profile_changes(self):
         self.check_cooldown_followup(rotate_media=True)
 
+    def expire_cooldown(self):
+        marker = self.policy_file.with_suffix(".json.last")
+        fields = marker.read_text().split()
+        expired = int(time.time()) - 1
+        replacement = f"{expired - 60} {expired}\n"
+        if fields[0] == "v2":
+            _, boot, wall, seconds, boot_time = fields
+            attempted, cooldown, boot_ns = map(int, (wall, seconds, boot_time))
+            self.assertEqual(boot, Path("/proc/sys/kernel/random/boot_id").read_text().strip())
+            self.assertEqual(cooldown, 60)
+            self.assertGreater(attempted, 0)
+            now_ns = time.clock_gettime_ns(time.CLOCK_BOOTTIME)
+            self.assertLessEqual(boot_ns, now_ns)
+            self.assertGreater(boot_ns + cooldown * 1_000_000_000, now_ns)
+            expired_boot_ns = now_ns - (cooldown + 1) * 1_000_000_000
+            if expired_boot_ns > 0:
+                replacement = f"v2 {boot} {expired - cooldown} {cooldown} {expired_boot_ns}\n"
+        else:
+            attempted, unblock = map(int, fields)
+            self.assertEqual(unblock - attempted, 60)
+            self.assertGreater(unblock, time.time())
+        temp = marker.with_suffix(".tmp")
+        temp.write_text(replacement)
+        temp.replace(marker)
+
     def check_cooldown_followup(self, rotate_media):
         with self.api.lock:
             self.install_catalogue([
@@ -454,14 +480,7 @@ class CatalogueLifecycle(NodeFixture):
         self.assertEqual([request["outbound"] for request in self.posts], ["proxy"])
 
         # Simulate waiting for the global cooldown, without skipping the second outbound's fresh check.
-        marker = self.policy_file.with_suffix(".json.last")
-        attempted, unblock = map(int, marker.read_text().split())
-        self.assertEqual(unblock - attempted, 60)
-        self.assertGreater(unblock, time.time())
-        expired = int(time.time()) - 1
-        temp = marker.with_suffix(".tmp")
-        temp.write_text(f"{expired - 60} {expired}\n")
-        temp.replace(marker)
+        self.expire_cooldown()
 
         final = self.wait_for(lambda s: rows(s)["media"]["members"][0]["name"] == "Media reserve", timeout=16)
         self.assertEqual([request["outbound"] for request in self.posts], ["proxy", "media"])
@@ -473,6 +492,66 @@ class CatalogueLifecycle(NodeFixture):
             self.assertLess(len(fresh_failures), 3, "the unchanged outbound restarted its failure count")
         for tag, name in [("proxy", "Proxy reserve"), ("healthy", "Healthy"), ("disabled", "Disabled")]:
             self.assertEqual(rows(final)[tag]["members"][0]["name"], name)
+
+    def test_qualified_later_outbound_gets_a_turn_before_the_first_switches_again(self):
+        with self.api.lock:
+            self.install_catalogue([
+                ("Primary", "wrong"), ("Secondary", "wrong"),
+                ("Proxy reserve A", "correct"), ("Proxy reserve B", "correct"),
+                ("Media reserve", "correct"),
+            ], [])
+            self.api.names.append("media")
+            self.set_active_locked(None, 1, "wrong", "proxy")
+            self.set_active_locked(None, 2, "wrong", "media")
+
+        keys = self.names_to_keys(self.catalogue())
+        for tag, reserves in [("proxy", ["Proxy reserve A", "Proxy reserve B"]), ("media", ["Media reserve"])]:
+            saved = self.command("failover", "save", {"policy": {
+                "outbound": tag, "mode": "outage", "candidates": [keys[name] for name in reserves],
+                "failure_method": "consecutive", "failures": 3, "allow_restart": True, "cooldown_seconds": 60,
+            }})
+            self.assertTrue(saved["ok"], saved)
+
+        def fail_first_reserve_after_assignment(tag):
+            if tag == "proxy":
+                selected = next(ref for ref in self.api.connected if ref["outbound"] == tag)
+                if selected["id"] == 3:
+                    # The first reserve passes its isolated probe but fails after assignment.
+                    self.set_active_locked(None, selected["id"], "wrong-when-assigned", tag)
+
+        self.after_switch = fail_first_reserve_after_assignment
+        self.start_monitor()
+        self.wait_for(lambda _: self.posts, timeout=15)
+        self.assertEqual([request["outbound"] for request in self.posts], ["proxy"])
+
+        def both_failed_after_switch(_):
+            proxy = [sample for sample in history(self, self.history_file, "proxy")["samples"]
+                     if sample["server"] == "Proxy reserve A" and sample["role"] == "active" and
+                     sample["state"] == "error"]
+            if len(proxy) < 3:
+                return False
+            media = [sample for sample in history(self, self.history_file, "media")["samples"]
+                     if sample["server"] == "Secondary" and sample["state"] == "error" and
+                     sample["at"] >= proxy[0]["at"]]
+            return len(media) >= 3
+
+        self.wait_for(both_failed_after_switch, timeout=15)
+        self.assertEqual([request["outbound"] for request in self.posts], ["proxy"])
+        self.expire_cooldown()
+
+        def media_restored(snap):
+            return any(member["name"] == "Media reserve" and member["https"]["state"] == "ok"
+                       for member in rows(snap).get("media", {}).get("members", []))
+
+        self.wait_for(media_restored, timeout=15)
+        self.assertEqual([(request["outbound"], request["id"]) for request in self.posts],
+                         [("proxy", 3), ("media", 5)])
+        self.expire_cooldown()
+
+        restored = self.wait_member("Proxy reserve B", "ok")
+        self.assertEqual(rows(restored)["proxy"]["members"][0]["https"]["http_code"], 204)
+        self.assertEqual([(request["outbound"], request["id"]) for request in self.posts],
+                         [("proxy", 3), ("media", 5), ("proxy", 4)])
 
     def test_catalogue_keys_survive_position_changes_and_stale_reserve_is_rejected(self):
         with self.api.lock:
@@ -657,4 +736,40 @@ class CatalogueLifecycle(NodeFixture):
         self.assertFalse(self.posts, "the old failure streak authorized a switch after credential recovery")
         primary = rows(result)["proxy"]["members"][0]
         self.assertEqual(primary["name"], "Primary")
+        self.assertEqual(primary["https"]["http_code"], 204)
+
+    def test_successful_reserve_probe_cannot_switch_after_active_endpoint_recovers(self):
+        primary_proxy = ThreadingTCPServer(("127.0.0.1", 0), self.socks.RequestHandlerClass,
+                                          bind_and_activate=False)
+        primary_proxy.daemon_threads = True
+        self.addCleanup(primary_proxy.server_close)
+        primary_proxy.server_bind()
+        with self.api.lock:
+            self.install_catalogue([("Primary", "correct")], [(self.main_feed, [("Reserve", "correct")])],
+                                   ports={"Primary": primary_proxy.server_address[1]})
+            self.set_active_locked(None, 1, "correct")
+        config_before = self.config.read_bytes()
+        saved = self.save_policy(self.names_to_keys(self.catalogue())["Reserve"])
+        self.assertTrue(saved["ok"], saved)
+        self.hold.set()
+        self.start_monitor()
+        self.assertTrue(self.waiting.wait(15), "the reserve was never probed while the primary endpoint was down")
+
+        try:
+            primary_proxy.server_activate()
+            Thread(target=primary_proxy.serve_forever, daemon=True).start()
+            self.addCleanup(primary_proxy.shutdown)
+            self.assertEqual(self.config.read_bytes(), config_before)
+        finally:
+            self.release.set()
+
+        def post_or_recovered(snap):
+            members = rows(snap).get("proxy", {}).get("members", [])
+            return self.posts or (members and members[0]["name"] == "Primary" and
+                                  members[0]["https"]["state"] == "ok")
+
+        result = self.wait_for(post_or_recovered, timeout=12)
+        self.assertFalse(self.posts, "the reserve triggered a switch after the unchanged primary endpoint recovered")
+        self.assertEqual(self.config.read_bytes(), config_before)
+        primary = rows(result)["proxy"]["members"][0]
         self.assertEqual(primary["https"]["http_code"], 204)

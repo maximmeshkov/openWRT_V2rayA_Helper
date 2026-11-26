@@ -10,6 +10,9 @@ struct digest {
     unsigned char block[64];
 };
 
+static const struct digest initial = {{0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,
+                                       0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19}, 0, {0}};
+
 static uint32_t rotate(uint32_t n, unsigned bits)
 {
     return (n >> bits) | (n << (32 - bits));
@@ -68,20 +71,31 @@ static void digest_update(struct digest *d, const void *bytes, size_t len)
     }
 }
 
+static void finish(struct digest *d, char key[33])
+{
+    uint64_t bits = d->bytes * 8;
+    unsigned char padding[64] = {0x80};
+    size_t len = 1 + (119 - d->bytes % 64) % 64;
+    digest_update(d, padding, len);
+    unsigned char trailer[8];
+    for (size_t i = 0; i < 8; i++) trailer[i] = (unsigned char)(bits >> (56 - 8 * i));
+    digest_update(d, trailer, sizeof(trailer));
+    for (size_t i = 0; i < 4; i++) snprintf(key + 8 * i, 9, "%08x", (unsigned int)d->h[i]);
+}
+
 void node_key(char key[33], const char *type, const char *source,
               const char *name, const char *address, const char *net)
 {
-    struct digest d = {{0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,
-                        0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19}, 0, {0}};
-    const char *fields[] = { type, source, name, address, net };
-    for (size_t i = 0; i < sizeof(fields)/sizeof(fields[0]); i++)
+    struct digest d = initial;
+    const char *fields[] = {type, source, name, address, net};
+    for (size_t i = 0; i < sizeof(fields) / sizeof(fields[0]); i++)
         digest_update(&d, fields[i], strlen(fields[i]) + 1);
-    uint64_t bits = d.bytes * 8;
-    unsigned char padding[64] = {0x80};
-    size_t len = 1 + (119 - d.bytes % 64) % 64;
-    digest_update(&d, padding, len);
-    unsigned char trailer[8];
-    for (size_t i = 0; i < 8; i++) trailer[i] = (unsigned char)(bits >> (56 - 8 * i));
-    digest_update(&d, trailer, sizeof(trailer));
-    for (size_t i = 0; i < 4; i++) snprintf(key + 8 * i, 9, "%08x", (unsigned int)d.h[i]);
+    finish(&d, key);
+}
+
+void text_fingerprint(char key[33], const char *text)
+{
+    struct digest d = initial;
+    digest_update(&d, text, strlen(text));
+    finish(&d, key);
 }

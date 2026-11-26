@@ -36,7 +36,7 @@ run_helper() {
 
 case "$1" in
 	list)
-		printf '%s\n' '{"status":{},"latency":{"outbound":""},"routing_context":{},"routing_preview":{"kind":"","value":"","outbound":"","before_line":0,"revision":""},"routing_save":{"kind":"","value":"","outbound":"","before_line":0,"revision":""},"failover_context":{},"failover_save":{"policy":{}}}'
+		printf '%s\n' '{"status":{},"latency":{"outbound":""},"routing_context":{},"routing_preview":{"kind":"","value":"","outbound":"","before_line":0,"revision":""},"routing_save":{"kind":"","value":"","outbound":"","before_line":0,"revision":""},"failover_context":{},"failover_save":{"policy":{}},"geodata_status":{},"geodata_start":{"action":""}}'
 		;;
 	call)
 		case "$2" in
@@ -46,6 +46,15 @@ case "$1" in
 			routing_save) run_helper routing save ;;
 			failover_context) run_helper failover context ;;
 			failover_save) run_helper failover save ;;
+			geodata_status) exec /usr/libexec/v2raya-helper-geodata status ;;
+			geodata_start)
+				action="$(jsonfilter -e '@.action' 2>/dev/null)"
+				case "$action" in
+					update|restore) exec /usr/libexec/v2raya-helper-geodata start "$action" ;;
+					*) printf '%s\n' '{"ok":false,"error":"Unknown geodata action"}' ;;
+				esac
+				exit 0
+				;;
 			status) ;;
 			*) exit 3 ;;
 		esac

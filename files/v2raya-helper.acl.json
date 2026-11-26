@@ -32,5 +32,18 @@
 				"v2raya-helper": [ "failover_save" ]
 			}
 		}
+	},
+	"v2raya-helper-geodata": {
+		"description": "Read and manage Xray geodata",
+		"read": {
+			"ubus": {
+				"v2raya-helper": [ "geodata_status" ]
+			}
+		},
+		"write": {
+			"ubus": {
+				"v2raya-helper": [ "geodata_start" ]
+			}
+		}
 	}
 }

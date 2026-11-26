@@ -16,7 +16,8 @@ local_api() {
 
 start_service() {
 	local api xray_config interval timeout workers mark token_file observatory observatory_max_age
-	local node_url node_code node_interval node_timeout
+	local node_url node_code node_interval node_timeout recover_xray restore_lan_redirect login_file
+	local respawn_threshold respawn_timeout respawn_retry
 	config_load v2raya_helper
 	config_get api main api
 	config_get xray_config main xray_config
@@ -29,20 +30,23 @@ start_service() {
 	config_get workers main workers 2
 	config_get mark main mark 0x80
 	config_get token_file main token_file
+	config_get login_file main login_file
 	config_get observatory main observatory
 	config_get observatory_max_age main observatory_max_age
 	config_get node_url main node_url 'https://cp.cloudflare.com/generate_204'
 	config_get node_code main node_code 204
 	config_get node_interval main node_interval 60
 	config_get node_timeout main node_timeout 8
+	config_get_bool recover_xray main recover_xray 0
+	config_get_bool restore_lan_redirect main restore_lan_redirect 0
 
 	umask 077
-	mkdir -p /var/run/v2raya-helper || return 1
 	procd_open_instance
 	procd_set_param command /usr/bin/v2raya-helper --api "$api" --interval "$interval" \
 		--timeout "$timeout" --workers "$workers" --mark "$mark" \
 		--output /var/run/v2raya-helper/status.json
 	[ -z "$token_file" ] || procd_append_param command --token-file "$token_file"
+	[ -z "$login_file" ] || procd_append_param command --login-file "$login_file"
 	[ -z "$xray_config" ] || procd_append_param command --xray-config "$xray_config"
 	if [ -n "$xray_config" ] && [ -n "$node_url" ]; then
 		procd_append_param command --node-url "$node_url" --node-code "$node_code" \
@@ -52,7 +56,16 @@ start_service() {
 	fi
 	[ -z "$observatory" ] || procd_append_param command --observatory "$observatory"
 	[ -z "$observatory_max_age" ] || procd_append_param command --observatory-max-age "$observatory_max_age"
-	procd_set_param respawn
+	if [ "$recover_xray" = 1 ]; then
+		procd_append_param command --recover-xray --recovery-state /var/run/v2raya-helper/xray-recovery
+	fi
+	if [ "$restore_lan_redirect" = 1 ]; then
+		procd_append_param command --restore-lan-redirect --redirect-state /var/run/v2raya-helper/lan-redirect
+	fi
+	respawn_threshold="$(uci_get 'system.@service[0].respawn_threshold')"
+	respawn_timeout="$(uci_get 'system.@service[0].respawn_timeout')"
+	respawn_retry="$(uci_get 'system.@service[0].respawn_retry')"
+	procd_set_param respawn "${respawn_threshold:-3600}" "${respawn_timeout:-5}" "${respawn_retry:-0}"
 	procd_set_param stderr 1
 	procd_close_instance
 }

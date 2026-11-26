@@ -21,5 +21,11 @@
 		"order": 30,
 		"action": { "type": "view", "path": "v2raya-helper/latency" },
 		"depends": { "acl": [ "v2raya-helper" ] }
+	},
+	"admin/services/v2raya-helper/geodata": {
+		"title": "GeoData",
+		"order": 40,
+		"action": { "type": "view", "path": "v2raya-helper/geodata" },
+		"depends": { "acl": [ "v2raya-helper-geodata" ] }
 	}
 }

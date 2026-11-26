@@ -3,6 +3,7 @@
 'require rpc';
 'require poll';
 'require dom';
+'require v2raya-helper.menu as helperMenu';
 
 var readHistory = rpc.declare({
 	object: 'v2raya-helper',
@@ -212,6 +213,7 @@ return view.extend({
 	handleReset: null,
 
 	load: function() {
+		helperMenu.refresh();
 		return readHistory('').catch(function() { return null; });
 	},
 

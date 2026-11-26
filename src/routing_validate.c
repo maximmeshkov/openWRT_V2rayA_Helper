@@ -69,6 +69,23 @@ static void validate_child(pid_t parent, int input, const char *core_binary, cha
     _exit(126);
 }
 
+int xray_validate_config(const char *core_binary, const char *assets_dir,
+                         int input, unsigned int timeout_ms)
+{
+    if (!core_binary || core_binary[0] != '/' || !assets_dir || assets_dir[0] != '/' ||
+        !regular_file(core_binary, 0)) return 0;
+
+    char env[sizeof("XRAY_LOCATION_ASSET=") + PATH_MAX];
+    int env_len = snprintf(env, sizeof(env), "XRAY_LOCATION_ASSET=%s", assets_dir);
+    int64_t now = monotonic_ms();
+    if (env_len < 0 || (size_t)env_len >= sizeof(env) || now < 0) return 0;
+
+    pid_t parent = getpid();
+    pid_t child = fork();
+    if (child == 0) validate_child(parent, input, core_binary, env);
+    return child > 0 && wait_for_validation(child, now + timeout_ms);
+}
+
 int routing_validate_advanced(const char *kind, const char *value,
                               const char *core_binary, const char *assets_dir)
 {
@@ -92,10 +109,6 @@ int routing_validate_advanced(const char *kind, const char *value,
         if (len < 0 || (size_t)len >= sizeof(path) || !regular_file(path, 1)) return 0;
     }
 
-    char env[sizeof("XRAY_LOCATION_ASSET=") + PATH_MAX];
-    int env_len = snprintf(env, sizeof(env), "XRAY_LOCATION_ASSET=%s", assets_dir);
-    if (env_len < 0 || (size_t)env_len >= sizeof(env)) return 0;
-
     char spec[MAX_LITERAL + sizeof("geosite:")];
     snprintf(spec, sizeof(spec), "%s:%s", kind, value);
     json_object *literal = json_object_new_string(spec);
@@ -115,14 +128,8 @@ int routing_validate_advanced(const char *kind, const char *value,
     ssize_t written;
     do { written = write(channel[1], config, (size_t)len); } while (written < 0 && errno == EINTR);
     close(channel[1]);
-    int64_t now = monotonic_ms();
-    if (written != len || now < 0) {
-        close(channel[0]);
-        return 0;
-    }
-    pid_t parent = getpid();
-    pid_t child = fork();
-    if (child == 0) validate_child(parent, channel[0], core_binary, env);
+    int valid = written == len &&
+                xray_validate_config(core_binary, assets_dir, channel[0], VALIDATION_TIMEOUT_MS);
     close(channel[0]);
-    return child > 0 && wait_for_validation(child, now + VALIDATION_TIMEOUT_MS);
+    return valid;
 }

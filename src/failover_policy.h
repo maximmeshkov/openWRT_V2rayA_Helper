@@ -11,6 +11,7 @@
 #define FAILOVER_MAX_FAILURES 30
 #define FAILOVER_DEFAULT_WINDOW_MINUTES 10
 #define FAILOVER_DEFAULT_COOLDOWN 900
+#define FAILOVER_MAX_COOLDOWN 86400
 
 enum failover_mode { FAILOVER_OFF, FAILOVER_OUTAGE, FAILOVER_SCHEDULED };
 enum failover_failure_method { FAILOVER_CONSECUTIVE, FAILOVER_WINDOW };
@@ -59,22 +60,28 @@ int failover_policy_selects(const struct failover_policy *policy, const char *id
 /* A saved exclusion list also rules out candidates with unverifiable endpoints. */
 int failover_policy_excludes(const struct failover_policy *policy, const char *endpoint);
 
-/* A failed sample is a confirmed probe failure. Unsupported or unavailable
- * means UNKNOWN and clears the run. active id must change with its profile. */
+/* Record a new, fresh result. An aging cached result does not end a run.
+ * An UNKNOWN result does. The active ID must change with its profile. */
 void failover_record(struct failover_streak *streak, const struct failover_policy *policy,
                      const struct failover_sample *active, time_t now, long maximum_age);
 
 /* Check whether it is time to probe candidates. */
 int failover_policy_ready(const struct failover_policy *policy,
                 const struct failover_sample *active, const struct failover_streak *streak,
-                time_t now, long maximum_age, time_t last_switch);
+                time_t now, long maximum_age, long cooldown_age);
 
-/* Return a borrowed ID from samples or NULL. last_switch is the latest
- * attempted switch timestamp, including attempts for a different outbound.
+/* confirmed_at is the successful recheck of the active failure or latency after the reserve probe.
+ * The qualifying streak is still checked against the current window and cooldown. */
+int failover_policy_confirmed(const struct failover_policy *policy, const struct failover_sample *active,
+                             const struct failover_streak *streak, const struct failover_sample *candidate,
+                             time_t confirmed_at, time_t now, long maximum_age, long cooldown_age);
+
+/* Return a borrowed ID from samples or NULL. cooldown_age is elapsed time
+ * since the most recent attempt, including attempts for another outbound.
  * A candidate must succeed at or after the newest active-node sample. */
 const char *failover_policy_choose(const struct failover_policy *policy,
                 const struct failover_sample *active, const struct failover_streak *streak,
                 const struct failover_sample *samples, size_t count, time_t now,
-                long maximum_age, time_t last_switch);
+                long maximum_age, long cooldown_age);
 
 #endif

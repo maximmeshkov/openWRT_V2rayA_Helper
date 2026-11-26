@@ -1,6 +1,8 @@
 #define _GNU_SOURCE
 #include "failover_monitor.h"
+#include "boot_id.h"
 #include "failover_api.h"
+#include "failover_cooldown.h"
 #include "failover_endpoint.h"
 #include "failover_policy.h"
 #include "failover_profile.h"
@@ -28,13 +30,14 @@ struct status {
 struct failover_monitor {
     const char *path;
     char *lock_path, *last_path;
+    char boot_id[BOOT_ID_LENGTH + 1];
     struct v2raya_api api;
     struct https_options https;
     struct latency_history *history;
     uint32_t mark;
     json_object *settings;
     struct status *rows;
-    size_t count;
+    size_t count, next_outbound;
     json_object *switch_config;
     size_t switched_row;
     char switched_key[FAILOVER_ID_LIMIT + 1];
@@ -61,6 +64,7 @@ struct failover_monitor *failover_monitor_create(const char *path, const struct 
     m->https = *https;
     m->history = history;
     m->mark = mark;
+    boot_id_read(m->boot_id);
     if (asprintf(&m->lock_path, "%s.lock", path) < 0 ||
         asprintf(&m->last_path, "%s.last", path) < 0) {
         failover_monitor_free(m);
@@ -110,42 +114,6 @@ static json_object *reload_policies(struct failover_monitor *m)
         m->settings = settings;
     } else json_object_put(settings);
     return json_object_object_get(m->settings, "policies");
-}
-
-static time_t last_attempt(const char *path, time_t now)
-{
-    int fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
-    if (fd < 0) return errno == ENOENT ? 0 : -1;
-    char buffer[64];
-    ssize_t n = read(fd, buffer, sizeof(buffer) - 1);
-    close(fd);
-    if (n <= 0 || n >= (ssize_t)sizeof(buffer)-1) return -1;
-    buffer[n] = '\0';
-    char *end, *tail;
-    errno = 0;
-    long long value = strtoll(buffer, &end, 10);
-    if (errno || *end != ' ' || value <= 0) return -1;
-    long long unblock = strtoll(end+1, &tail, 10);
-    if (errno || tail != buffer+n-1 || *tail != '\n' || unblock < value || unblock-value > 86400)
-        return -1;
-    /* Even a shorter policy on another outbound must honor this pause. */
-    return now < (time_t)unblock ? -1 : (time_t)value;
-}
-
-static int record_attempt(const char *path, time_t when, unsigned cooldown)
-{
-    char *temp = NULL;
-    if (asprintf(&temp, "%s.XXXXXX", path) < 0) return -1;
-    int fd = mkstemp(temp);
-    int rc = -1;
-    if (fd >= 0) {
-        int written = dprintf(fd, "%lld %lld\n", (long long)when, (long long)when+cooldown);
-        if (written > 0 && fsync(fd)) written = -1;
-        if (!close(fd) && written > 0) rc = rename(temp, path);
-        if (rc) unlink(temp);
-    }
-    free(temp);
-    return rc;
 }
 
 static const struct outbound *single_outbound(const struct inventory *inv, const char *name)
@@ -275,23 +243,29 @@ struct switch_gate {
     const struct failover_sample *active, *candidate;
     const char *config_path;
     json_object *config;
+    time_t confirmed_at;
     long max_age;
+    const volatile sig_atomic_t *stopping;
     int attempted;
 };
 
 static int permit_switch(void *opaque)
 {
     struct switch_gate *gate = opaque;
-    time_t now = time(NULL), last = last_attempt(gate->monitor->last_path, now);
-    if (last < 0 ||
-        !failover_policy_choose(gate->policy, gate->active, &gate->status->streak,
-                                gate->candidate, 1, now, gate->max_age, last))
+    struct failover_monitor *m = gate->monitor;
+    time_t now = time(NULL);
+    long age = failover_cooldown_age(m->last_path, m->boot_id, now);
+    if (*gate->stopping ||
+        !failover_policy_confirmed(gate->policy, gate->active, &gate->status->streak,
+                                   gate->candidate, gate->confirmed_at, now, gate->max_age, age))
         return 0;
     json_object *current = node_config_read(gate->config_path);
     int unchanged = current && json_object_equal(current, gate->config);
     json_object_put(current);
-    if (!unchanged || record_attempt(gate->monitor->last_path, now, gate->policy->cooldown_seconds))
+    if (!unchanged || *gate->stopping ||
+        failover_cooldown_save(m->last_path, m->boot_id, now, gate->policy->cooldown_seconds))
         return 0;
+    if (*gate->stopping) return 0;
     gate->attempted = 1;
     return 1;
 }
@@ -342,10 +316,30 @@ static const struct failover_node *pool_candidate(const struct candidate_pool *p
     return NULL;
 }
 
-static int switch_candidate(struct failover_monitor *m, const struct failover_policy *policy,
-    struct status *status, const struct member *member, const struct failover_sample *active, long max_age,
-    const char *config_path, json_object *config)
+static time_t confirm_active(struct failover_monitor *m, const struct failover_policy *policy, struct status *status,
+                             const struct outbound *out, const struct failover_sample *active, json_object *config)
 {
+    struct member checked = out->members[0];
+    struct probe_job job = {.out = out, .member = &checked};
+    probe_members(&job, 1, m->https.timeout * 1000, m->mark, &m->https, config);
+    struct failover_sample result = active_sample(&checked);
+    if ((active->state == FAILOVER_FAILED && result.state == FAILOVER_FAILED) ||
+        (active->state == FAILOVER_OK && result.state == FAILOVER_OK && result.ms > (long)policy->max_ms))
+        return result.checked;
+
+    /* The confirmation can veto a switch but cannot advance either streak. */
+    status->ready = 0;
+    status->streak.failed = status->streak.slow = 0;
+    if (result.state == FAILOVER_UNKNOWN)
+        status->streak.window_count = 0;
+    return 0;
+}
+
+static int switch_candidate(struct failover_monitor *m, const struct failover_policy *policy,
+    struct status *status, const struct outbound *out, const struct failover_sample *active, long max_age,
+    const char *config_path, json_object *config, const volatile sig_atomic_t *stopping)
+{
+    const struct member *member = &out->members[0];
     char error[160] = {0};
     struct failover_catalogue catalog = {0};
     int attempted = 0;
@@ -359,30 +353,33 @@ static int switch_candidate(struct failover_monitor *m, const struct failover_po
     }
     if (!current) goto done;
     struct candidate_pool pool = selected_pool(&catalog, policy);
-    for (size_t i = 0; i < pool.total_count; i++) {
+    for (size_t i = 0; i < pool.total_count && !*stopping; i++) {
         size_t index = status->next_candidate++ % pool.total_count;
         const char *subscription;
         const struct failover_node *candidate = pool_candidate(&pool, &catalog, policy, index, &subscription);
         if (!candidate || candidate == current || failover_policy_excludes(policy, candidate->endpoint)) continue;
         char *link = failover_api_profile(&m->api, candidate, error, sizeof(error));
-        if (!link) {
-            /* A large feed must not trigger a burst of profile exports. */
-            if (subscription) break;
-            continue;
-        }
+        if (!link) break;
         struct failover_sample result = probe_candidate(m, candidate, policy, link);
         result.id = candidate->key;
         result.subscription = subscription;
         result.endpoint = candidate->endpoint;
-        int lock = failover_lock_settings(m->lock_path);
+        time_t now = time(NULL);
+        long age = failover_cooldown_age(m->last_path, m->boot_id, now);
+        time_t confirmed_at = 0;
+        if (!*stopping &&
+            failover_policy_choose(policy, active, &status->streak, &result, 1, now, max_age, age))
+            confirmed_at = confirm_active(m, policy, status, out, active, config);
+        int lock = confirmed_at && !*stopping ? failover_lock_settings(m->lock_path) : -1;
         if (lock >= 0) {
             json_object *fresh = failover_settings_read(m->path);
-            time_t now = time(NULL), last = last_attempt(m->last_path, now);
-            if (fresh && last >= 0 && json_object_equal(fresh, m->settings) &&
-                failover_policy_choose(policy, active, &status->streak, &result, 1, now, max_age, last)) {
+            now = time(NULL);
+            age = failover_cooldown_age(m->last_path, m->boot_id, now);
+            if (fresh && json_object_equal(fresh, m->settings) &&
+                failover_policy_confirmed(policy, active, &status->streak, &result, confirmed_at, now, max_age, age)) {
                 struct switch_gate gate = {.monitor = m, .policy = policy, .status = status,
                     .active = active, .candidate = &result, .config_path = config_path,
-                    .config = config, .max_age = max_age};
+                    .config = config, .confirmed_at = confirmed_at, .max_age = max_age, .stopping = stopping};
                 int rc = failover_api_connect(&m->api, policy->outbound, current, candidate, link, subscription,
                                                permit_switch, &gate, error, sizeof(error));
                 attempted = gate.attempted;
@@ -412,22 +409,31 @@ done:
     return attempted;
 }
 
-void failover_monitor_tick(struct failover_monitor *m, const struct inventory *inv,
-                           const char *config_path, json_object *config)
+int failover_monitor_tick(struct failover_monitor *m, const struct inventory *inv,
+                          const char *config_path, json_object *config, const volatile sig_atomic_t *stopping)
 {
-    if (!m) return;
+    if (!m) return 0;
     if (!inv || !inv->running || !config || m->switch_config) {
         /* An unmatched confirmation means the following discovery did not
          * observe the expected configuration transition. */
         failover_monitor_reset(m);
-        return;
+        return 0;
     }
     json_object *policies = reload_policies(m);
-    if (!policies || !m->count) return;
+    if (!policies || !m->count) return 0;
     long max_age = 2 * m->https.interval + m->https.timeout;
-    time_t now = time(NULL), last = last_attempt(m->last_path, now);
+    time_t now = time(NULL);
+    long age = failover_cooldown_age(m->last_path, m->boot_id, now);
+    if (age == FAILOVER_COOLDOWN_LEGACY_FUTURE || age == FAILOVER_COOLDOWN_EXPIRED) {
+        int lock = failover_lock_settings(m->lock_path);
+        if (lock >= 0) {
+            failover_cooldown_maintain(m->last_path, m->boot_id, now);
+            close(lock);
+            age = failover_cooldown_age(m->last_path, m->boot_id, now);
+        }
+    }
     /* Evaluate every enabled row before the first attempt can restart Xray. */
-    for (size_t i = 0; i < m->count; i++) {
+    for (size_t i = 0; i < m->count && !*stopping; i++) {
         struct status *status = &m->rows[i];
         status->ready = 0;
         struct failover_policy policy;
@@ -442,17 +448,20 @@ void failover_monitor_tick(struct failover_monitor *m, const struct inventory *i
         struct failover_sample active = active_sample(member);
         if (status->awaiting_sample) {
             if (!strcmp(member->key, status->streak.id) && !active.checked && member->https.state &&
-                !strcmp(member->https.state, "pending") && status->streak.checked <= now &&
-                difftime(now, status->streak.checked) <= max_age)
+                !strcmp(member->https.state, "pending") && status->streak.checked <= now)
                 continue;
             status->awaiting_sample = 0;
             if (active.checked <= status->streak.checked)
                 *status = (struct status){0};
         }
         failover_record(&status->streak, &policy, &active, now, max_age);
-        status->ready = last >= 0 && failover_policy_ready(&policy, &active, &status->streak, now, max_age, last);
+        status->ready = failover_policy_ready(&policy, &active, &status->streak, now, max_age, age);
     }
-    for (size_t i = 0; i < m->count; i++) {
+    /* Return to inventory and core recovery before probing another outbound. */
+    size_t first = m->next_outbound;
+    int checked_row = 0;
+    for (size_t offset = 0; offset < m->count && !*stopping; offset++) {
+        size_t i = (first + offset) % m->count;
         struct status *status = &m->rows[i];
         if (!status->ready) continue;
         struct failover_policy policy;
@@ -462,7 +471,11 @@ void failover_monitor_tick(struct failover_monitor *m, const struct inventory *i
         const struct member *member = &out->members[0];
         struct failover_sample active = active_sample(member);
         if (status->tried_sample == active.checked) continue;
+        if (checked_row) return 1;
+        checked_row = 1;
         status->tried_sample = active.checked;
-        if (switch_candidate(m, &policy, status, member, &active, max_age, config_path, config)) break;
+        m->next_outbound = (i + 1) % m->count;
+        if (switch_candidate(m, &policy, status, out, &active, max_age, config_path, config, stopping)) break;
     }
+    return 0;
 }

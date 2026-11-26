@@ -157,7 +157,7 @@ int failover_command(int argc, char **argv)
     else {
         initialized = 1;
         version = v2raya_api_get_version(&api, error, sizeof(error));
-        if (!version || load_inventory(api.base, api.token_file, NULL, api.timeout_ms,
+        if (!version || load_inventory(&api, NULL,
                                         &inventory, error, sizeof(error)) ||
             failover_catalogue_read(&api, &catalog, error, sizeof(error))) {
             failure = save ? (*error ? error : "Cannot read servers from v2rayA") :

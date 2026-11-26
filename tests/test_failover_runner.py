@@ -2,7 +2,9 @@
 import json
 import os
 from pathlib import Path
+from socketserver import StreamRequestHandler, ThreadingTCPServer
 import subprocess
+from threading import Thread
 from urllib.parse import parse_qs, urlsplit
 from unittest.mock import patch
 
@@ -18,6 +20,7 @@ class FailoverRunner(NodeFixture):
         self.token_file.write_text("fixture-failover-token\n")
         self.version = "2.2.7.4"
         self.share_password = "correct"
+        self.reserve_port = self.port
         self.posts = []
         previous_reply = self.api.reply
         fixture = self
@@ -33,7 +36,7 @@ class FailoverRunner(NodeFixture):
                 if target != {"_type": "server", "id": 2}:
                     return 404, {"code": "FAIL"}
                 return 200, {"code": "SUCCESS", "data": {
-                    "sharingAddress": f"socks5://fixture:{self.share_password}@127.0.0.1:{self.port}"}}
+                    "sharingAddress": f"socks5://fixture:{self.share_password}@127.0.0.1:{self.reserve_port}"}}
             return previous_reply(path, auth)
 
         self.api.reply = reply
@@ -113,6 +116,126 @@ class FailoverRunner(NodeFixture):
         self.assertGreaterEqual(active_failures, 3)
         self.assertGreaterEqual(reserve_successes, 1)
         self.assertNotIn("fixture-failover-token", self.output.read_text())
+
+    def test_queue_delay_preserves_distinct_failures_for_a_working_reserve(self):
+        class HangingSocks(StreamRequestHandler):
+            def handle(self):
+                self.connection.settimeout(4)
+                try:
+                    if self.rfile.read(1) == b"\x05":
+                        self.rfile.read()
+                except OSError:
+                    pass
+
+        slow = ThreadingTCPServer(("127.0.0.1", 0), HangingSocks)
+        slow.daemon_threads = True
+        self.addCleanup(slow.server_close)
+        self.addCleanup(slow.shutdown)
+        Thread(target=slow.serve_forever, daemon=True).start()
+        slow_port = slow.server_address[1]
+        names = ["media", "work", "video", "chat"]
+        with self.api.lock:
+            outbounds = [{"tag": name, "protocol": "socks", "settings": {"servers": [{
+                "address": "127.0.0.1", "port": slow_port,
+                "users": [{"user": "fixture", "pass": "correct"}],
+            }]}} for name in names]
+            self.config.write_text(json.dumps({"outbounds": outbounds, "routing": {"rules": []}}))
+            self.nodes[0]["address"] = f"127.0.0.1:{slow_port}"
+            self.api.names = names
+            self.api.connected = [assignment(name, 1) for name in names]
+
+        healthy = subprocess.check_output([
+            "curl", "--silent", "--show-error", "--fail", "--max-time", "5", "--cacert", self.cert,
+            "--noproxy", "", "--proxy", f"socks5h://fixture:correct@127.0.0.1:{self.port}",
+            "--output", os.devnull, "--write-out", "%{http_code}", "https://check.invalid/generate_204",
+        ], text=True, timeout=8)
+        self.assertEqual(healthy, "204")
+        self.seen.clear()
+
+        self.choose_policy("outage")
+        with patch.dict(os.environ, SSL_CERT_FILE=self.cert):
+            self.start("--workers", "2", "--token-file", str(self.token_file),
+                       "--node-url", "https://check.invalid/generate_204", "--node-interval", "1",
+                       "--node-timeout", "2", "--xray-config", str(self.config),
+                       "--failover-file", str(self.settings))
+
+        failures = set()
+
+        def collect(snapshot):
+            members = rows(snapshot).get("media", {}).get("members", [])
+            if members and members[0]["name"] == "Primary":
+                sample = members[0]["https"]
+                if sample.get("detail") in ("https_timeout", "dns_or_probe_timeout"):
+                    failures.add(sample["checked_at"])
+            if len(failures) < 3:
+                self.assertFalse(self.posts, "switch before three separately completed active failures")
+            return len(failures) >= 3
+
+        self.wait_for(collect, timeout=25)
+
+        def restored(snapshot):
+            members = rows(snapshot).get("media", {}).get("members", [])
+            return members and members[0]["name"] == "Reserve" and members[0]["https"].get("http_code") == 204
+
+        try:
+            self.wait_for(restored, timeout=7)
+        except AssertionError as error:
+            raise AssertionError(f"no recovery after distinct failures at {sorted(failures)}: {error}") from error
+        self.assertEqual(len(self.posts), 1)
+        self.assertGreaterEqual(self.posts[0][4], 1, "reserve was not verified before the switch")
+
+    def test_seven_unreachable_reserves_allow_inventory_updates_between_checks(self):
+        snapshots = []
+        status_path = self.output
+
+        class UnresponsiveReserve(StreamRequestHandler):
+            def handle(self):
+                self.connection.settimeout(4)
+                try:
+                    if self.rfile.read(1) == b"\x05":
+                        snapshots.append(status_path.stat().st_mtime_ns)
+                        self.rfile.read()
+                except OSError:
+                    pass
+
+        slow = ThreadingTCPServer(("127.0.0.1", 0), UnresponsiveReserve)
+        slow.daemon_threads = True
+        self.addCleanup(slow.server_close)
+        self.addCleanup(slow.shutdown)
+        Thread(target=slow.serve_forever, daemon=True).start()
+        self.reserve_port = slow.server_address[1]
+        names = ["media", "ai", "work", "video", "chat", "manual", "local"]
+        with self.api.lock:
+            self.nodes[1]["address"] = f"127.0.0.1:{self.reserve_port}"
+            self.api.names = names
+            self.api.connected = [assignment(name, 1) for name in names]
+            config = json.loads(self.config.read_text())
+            config["outbounds"] = [dict(config["outbounds"][0], tag=name) for name in names]
+            self.config.write_text(json.dumps(config))
+        self.choose_policy("outage")
+        policy = json.loads(self.settings.read_text())["policies"][0]
+        self.settings.write_text(json.dumps({"policies": [dict(policy, outbound=name) for name in names]}))
+        history = self.settings.with_suffix(".latency")
+        with patch.dict(os.environ, SSL_CERT_FILE=self.cert):
+            self.start("--workers", "7", "--token-file", str(self.token_file),
+                       "--node-url", "https://check.invalid/generate_204", "--node-interval", "1",
+                       "--node-timeout", "2", "--xray-config", str(self.config), "--failover-file",
+                       str(self.settings), "--latency-file", str(history))
+        self.wait_for(lambda _: len(snapshots) >= 2, timeout=15)
+        self.assertGreater(snapshots[1], snapshots[0], "two reserve timeouts ran without an inventory cycle")
+
+        def all_outbounds_checked(_):
+            if not history.exists():
+                return False
+            for name in names:
+                result = subprocess.check_output([self.binary, "latency", history, name], text=True, timeout=4)
+                if not any(sample["state"] == "timeout" and sample["role"] == "reserve"
+                           for sample in json.loads(result)["samples"]):
+                    return False
+            return True
+
+        self.wait_for(all_outbounds_checked, timeout=40)
+        self.assertFalse(self.posts)
 
     def test_disabled_missing_and_failing_reserves_do_not_switch(self):
         self.choose_policy("off")

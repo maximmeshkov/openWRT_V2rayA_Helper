@@ -14,13 +14,17 @@ from test_monitor import MonitorHarness, assignment, profile, rows
 
 
 class NodeFixture(MonitorHarness):
+    https_hosts = ("check.invalid",)
+
     def setUp(self):
         super().setUp()
         self.config = Path(self.tmp.name, "core.json")
         cert, key = [Path(self.tmp.name, name) for name in ("ca.pem", "key.pem")]
+        names = ",".join(f"DNS:{host}" for host in self.https_hosts)
+        hosts = {host.encode() for host in self.https_hosts}
         subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
                         "-days", "1", "-subj", "/CN=check.invalid", "-addext",
-                        "subjectAltName=DNS:check.invalid", "-keyout", key, "-out", cert],
+                        f"subjectAltName={names}", "-keyout", key, "-out", cert],
                        check=True, stderr=subprocess.DEVNULL)
         self.cert = str(cert)
         tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
@@ -45,7 +49,7 @@ class NodeFixture(MonitorHarness):
                     return
                 user = self.rfile.read(self.rfile.read(1)[0])
                 password = self.rfile.read(self.rfile.read(1)[0])
-                if (user, password) != (b"fixture", b"correct"):
+                if (user, password) != (b"fixture", b"correct") or getattr(self.server, "reject_auth", False):
                     fixture.auth_failures.append(time.monotonic())
                     self.wfile.write(b"\x01\x01")
                     return
@@ -60,7 +64,7 @@ class NodeFixture(MonitorHarness):
                     while line := self.rfile.readline():
                         self.wfile.write(line)
                     return
-                if (host, port) != (b"check.invalid", 443):
+                if host not in hosts or port != 443:
                     return
                 try:
                     with tls.wrap_socket(self.connection, server_side=True) as s, s.makefile("rb") as request:

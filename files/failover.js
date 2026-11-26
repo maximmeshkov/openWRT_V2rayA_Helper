@@ -3,6 +3,7 @@
 'require rpc';
 'require session';
 'require poll';
+'require v2raya-helper.menu as helperMenu';
 
 var readContext = rpc.declare({
 	object: 'v2raya-helper',
@@ -104,6 +105,7 @@ return view.extend({
 	handleReset: null,
 
 	load: function() {
+		helperMenu.refresh();
 		return readContext().catch(function() { return {}; });
 	},
 
@@ -161,6 +163,12 @@ return view.extend({
 			E('h3', {}, [_('Always excluded')]), exclusionList
 		]);
 		var count = E('p');
+		var selectAll = E('button', {
+			'id': 'failover-select-all', 'type': 'button', 'class': 'btn cbi-button cbi-button-neutral'
+		}, [_('Select all')]);
+		var clearAll = E('button', {
+			'id': 'failover-clear-all', 'type': 'button', 'class': 'btn cbi-button cbi-button-neutral'
+		}, [_('Clear all')]);
 		var removeUnavailable = E('button', {
 			'id': 'failover-remove-unavailable', 'type': 'button', 'class': 'btn cbi-button cbi-button-neutral'
 		}, [_('Remove unavailable selections')]);
@@ -193,7 +201,13 @@ return view.extend({
 			subscriptionSection,
 			exclusionSection,
 			row(_('Replacement servers'), search),
-			E('div', { 'style': 'display:flex;flex-wrap:wrap;align-items:baseline;gap:.5em' }, [count, removeUnavailable]),
+			E('details', { 'class': 'cbi-section-descr' }, [
+				E('summary', {}, [_('How is a replacement server chosen?')]),
+				E('p', {}, [_('When a switch is due, the helper tests one reserve per cycle, rotating through the selected servers and subscriptions. It skips the current server and excluded addresses.')]),
+				E('p', {}, [_('The first reserve that passes a fresh HTTPS check is eligible. If high latency triggered the switch, the reserve must also meet the configured latency limit. The helper checks the current server again before switching.')])
+			]),
+			E('div', { 'style': 'display:flex;flex-wrap:wrap;align-items:baseline;gap:.5em' },
+				[selectAll, clearAll, count, removeUnavailable]),
 			list
 		]);
 		var availability = E('p', { 'class': 'cbi-section-descr' });
@@ -393,6 +407,43 @@ return view.extend({
 			});
 		}
 
+		function candidateLabel(node) {
+			return [node.name || node.address, node.address, node.net].filter(Boolean).join(' · ');
+		}
+
+		function changeAllCandidates(select) {
+			var policy = draft();
+			if (!policy || !canWrite || busy || !context || context.catalog_unavailable) return;
+			var chosen = new Set(policy.candidates);
+			var filter = search.value.trim().toLowerCase();
+			var capped = false;
+			if (select) {
+				var excluded = new Set(policy.exclusions);
+				for (var [key, node] of catalogue) {
+					if (chosen.has(key) || excluded.has(node.endpoint) || !candidateLabel(node).toLowerCase().includes(filter))
+						continue;
+					if (chosen.size >= candidateLimit) {
+						capped = true;
+						break;
+					}
+					chosen.add(key);
+				}
+			} else if (filter) {
+				var rows = context.supports_exclusions === true ? catalogueRows : catalogue;
+				rows.forEach(function(node, key) {
+					if (candidateLabel(node).toLowerCase().includes(filter)) chosen.delete(key);
+				});
+			} else {
+				chosen.clear();
+			}
+			if (chosen.size !== policy.candidates.length) {
+				policy.candidates = Array.from(chosen);
+				markEdited();
+				showCandidates();
+			}
+			if (capped) message(_('Some matching servers were left unselected because the limit is 64.'), true);
+		}
+
 		function showCandidates(focusKey) {
 			var previousScroll = list.scrollTop, focusButton = null;
 			list.textContent = '';
@@ -444,7 +495,7 @@ return view.extend({
 			(supportsExclusions ? catalogueRows : catalogue).forEach(function(node, key) {
 				var missing = !catalogue.has(key);
 				if (missing && !node.endpoint) return;
-				var label = [node.name || node.address, node.address, node.net].filter(Boolean).join(' · ');
+				var label = candidateLabel(node);
 				if (chosen.has(key) || !filter || label.toLowerCase().includes(filter)) {
 					if (missing) label += ' · ' + _('Ambiguous server');
 					candidate(key, label, missing, node.endpoint);
@@ -506,6 +557,11 @@ return view.extend({
 
 		function showCandidateCount() {
 			var chosen = draft().candidates;
+			var filtered = search.value.trim() !== '';
+			selectAll.textContent = filtered ? _('Select matching') : _('Select all');
+			clearAll.textContent = filtered ? _('Clear matching') : _('Clear all');
+			selectAll.disabled = !!context.catalog_unavailable || !catalogue.size;
+			clearAll.disabled = !!context.catalog_unavailable || !chosen.length;
 			var missing = chosen.filter(function(key) { return !catalogue.has(key); }).length;
 			var subscriptions = draft().subscriptions;
 			if (Array.isArray(context.subscriptions))
@@ -733,6 +789,8 @@ return view.extend({
 			message('', false);
 		});
 		search.addEventListener('input', showCandidates);
+		selectAll.addEventListener('click', function() { changeAllCandidates(true); });
+		clearAll.addEventListener('click', function() { changeAllCandidates(false); });
 		removeUnavailable.addEventListener('click', function() {
 			if (!draft() || !canWrite || busy || !context || context.catalog_unavailable) return;
 			draft().candidates = draft().candidates.filter(function(key) { return catalogue.has(key); });

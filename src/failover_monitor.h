@@ -1,6 +1,7 @@
 #ifndef V2RAYA_HELPER_FAILOVER_MONITOR_H
 #define V2RAYA_HELPER_FAILOVER_MONITOR_H
 
+#include <signal.h>
 #include "helper.h"
 #include "v2raya_api.h"
 
@@ -13,8 +14,9 @@ void failover_monitor_free(struct failover_monitor *monitor);
 void failover_monitor_reset(struct failover_monitor *monitor);
 void failover_monitor_config_changed(struct failover_monitor *monitor, const struct inventory *inventory,
                                      json_object *previous, json_object *next);
-void failover_monitor_tick(struct failover_monitor *monitor, const struct inventory *inventory,
-                           const char *config_path, json_object *config);
+/* Returns one if another eligible outbound was deferred to the next cycle. */
+int failover_monitor_tick(struct failover_monitor *monitor, const struct inventory *inventory,
+                          const char *config_path, json_object *config, const volatile sig_atomic_t *stopping);
 int failover_lock_settings(const char *lock_path);
 int failover_command(int argc, char **argv);
 

@@ -2,17 +2,29 @@
 #include "helper.h"
 #include "node_profile.h"
 #include "routing_editor.h"
+#include "routing_validate.h"
 #include "failover_monitor.h"
 #include "latency_history.h"
+#include "core_recovery.h"
+#include "lan_ingress.h"
+#include "login_refresh.h"
 #include <curl/curl.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <getopt.h>
 #include <inttypes.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
+
+#define RUNTIME_PARENT "/var/run"
+#define RUNTIME_NAME "v2raya-helper"
+#define RUNTIME_DIR RUNTIME_PARENT "/" RUNTIME_NAME
+#define DEFAULT_STATUS RUNTIME_DIR "/status.json"
+#define DEFAULT_LATENCY RUNTIME_DIR "/latency.json"
 
 static volatile sig_atomic_t stopping;
 
@@ -20,6 +32,43 @@ static void stop(int sig)
 {
     (void)sig;
     stopping = 1;
+}
+
+static int private_runtime_directory(const struct stat *info)
+{
+    return S_ISDIR(info->st_mode) && info->st_uid == geteuid() &&
+           (info->st_mode & (S_IRWXU | S_IRWXG | S_IRWXO)) == S_IRWXU;
+}
+
+static int open_runtime_directory(struct stat *identity)
+{
+    struct stat info;
+    if (lstat(RUNTIME_PARENT, &info) || info.st_uid != 0) return -1;
+    int parent = open(RUNTIME_PARENT, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (parent < 0) return -1;
+
+    int directory = -1;
+    if (!fstat(parent, &info) && info.st_uid == 0 && !(info.st_mode & (S_IWGRP | S_IWOTH))) {
+        if (!mkdirat(parent, RUNTIME_NAME, S_IRWXU) || errno == EEXIST) {
+            directory = openat(parent, RUNTIME_NAME, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+            if (directory >= 0 && (fstat(directory, identity) || !private_runtime_directory(identity))) {
+                close(directory);
+                directory = -1;
+            }
+        }
+    }
+    close(parent);
+    return directory;
+}
+
+static int runtime_is_current(const struct stat *identity)
+{
+    if (!identity) return 1;
+    struct stat info;
+    if (!lstat(RUNTIME_DIR, &info) && private_runtime_directory(&info) &&
+        info.st_dev == identity->st_dev && info.st_ino == identity->st_ino) return 1;
+    fputs("v2raya-helper: runtime directory was removed or replaced\n", stderr);
+    return 0;
 }
 
 static json_object *timestamp(time_t t)
@@ -52,10 +101,11 @@ static json_object *serialize_measure(struct measurement m, time_t now, long ttl
     return o;
 }
 
-static int publish(const char *path, const struct inventory *inv, const char *state,
+static int publish(const char *path, const struct stat *runtime, const struct inventory *inv, const char *state,
                    const char *message, long ttl, long route_ttl,
-                   const struct https_options *https)
+                   const struct https_options *https, struct lan_ingress ingress)
 {
+    if (!runtime_is_current(runtime)) return -1;
     time_t now = time(NULL);
     int valid = strcmp(state, "ok") == 0;
     struct measurement unavailable = {.state = "unknown", .detail = "inventory_unavailable"};
@@ -66,6 +116,17 @@ static int publish(const char *path, const struct inventory *inv, const char *st
     json_object_object_add(doc, "fresh_until", timestamp(now + ttl));
     if (https->url)
         json_object_object_add(doc, "node_check_interval", json_object_new_int64(https->interval));
+    if (valid && ingress.backend) {
+        json_object *lan = json_object_new_object();
+        add_string(lan, "mode", ingress.mode);
+        add_string(lan, "backend", ingress.backend);
+        add_string(lan, "ipv4", ingress.ipv4);
+        add_string(lan, "ipv6", ingress.ipv6);
+        if (ingress.reason) add_string(lan, "reason", ingress.reason);
+        if (ingress.ipv4_reason) add_string(lan, "ipv4_reason", ingress.ipv4_reason);
+        if (ingress.ipv6_reason) add_string(lan, "ipv6_reason", ingress.ipv6_reason);
+        json_object_object_add(doc, "lan_ingress", lan);
+    }
     json_object_object_add(doc, "outbounds", rows);
     for (size_t i = 0; i < inv->count; ++i) {
         const struct outbound *out = &inv->outbounds[i];
@@ -105,7 +166,7 @@ static int publish(const char *path, const struct inventory *inv, const char *st
         int fd = mkstemp(tmp);
         if (fd >= 0) {
             int written = json_object_to_fd(fd, doc, JSON_C_TO_STRING_PLAIN);
-            if (close(fd) == 0 && written == 0) rc = rename(tmp, path);
+            if (close(fd) == 0 && written == 0 && runtime_is_current(runtime)) rc = rename(tmp, path);
             if (rc != 0) unlink(tmp);
         }
         free(tmp);
@@ -248,6 +309,8 @@ int main(int argc, char **argv)
 {
     if (argc > 1 && !strcmp(argv[1], "routing"))
         return routing_editor_command(argc - 2, argv + 2);
+    if (argc == 4 && !strcmp(argv[1], "geodata-validate"))
+        return xray_validate_config(argv[2], argv[3], STDIN_FILENO, 35000) ? 0 : 1;
     if (argc > 1 && !strcmp(argv[1], "failover"))
         return failover_command(argc - 2, argv + 2);
     if (argc > 1 && !strcmp(argv[1], "latency"))
@@ -261,9 +324,9 @@ int main(int argc, char **argv)
     }
 
     const char *api = "http://127.0.0.1:2017", *token = NULL, *metrics = NULL;
-    const char *output = "/var/run/v2raya-helper/status.json", *xray_config = NULL;
+    const char *output = DEFAULT_STATUS, *xray_config = NULL;
     const char *failover_file = NULL;
-    const char *latency_file = NULL;
+    const char *latency_file = NULL, *login_file = NULL, *recovery_state = NULL, *redirect_state = NULL;
     struct https_options https = {.interval = 60, .timeout = 8, .code = 204};
     json_object *profiles = NULL;
     long interval = 10, timeout = 3, workers = 2, route_ttl = 60;
@@ -276,9 +339,12 @@ int main(int argc, char **argv)
         {"node-url",1,0,'N'}, {"node-code",1,0,'C'}, {"node-interval",1,0,'A'}, {"node-timeout",1,0,'T'},
         {"failover-file",1,0,'F'},
         {"latency-file",1,0,'H'},
+        {"login-file",1,0,'L'},
+        {"recover-xray",0,0,'R'}, {"recovery-state",1,0,'S'},
+        {"restore-lan-redirect",0,0,'D'}, {"redirect-state",1,0,'P'},
         {"help",0,0,'h'}, {0,0,0,0}
     };
-    int opt;
+    int opt, recover_xray = 0, restore_redirect = 0;
     while ((opt = getopt_long(argc, argv, "", options, NULL)) != -1) {
         switch (opt) {
         case 'a': api = optarg; break;
@@ -297,19 +363,46 @@ int main(int argc, char **argv)
         case 'T': https.timeout = number(optarg, 1, 60); break;
         case 'F': failover_file = optarg; break;
         case 'H': latency_file = optarg; break;
+        case 'L': login_file = optarg; break;
+        case 'R': recover_xray = 1; break;
+        case 'S': recovery_state = optarg; break;
+        case 'D': restore_redirect = 1; break;
+        case 'P': redirect_state = optarg; break;
         case 'h':
             puts("v2raya-helper [--api URL] [--token-file PATH] [--output PATH]\n"
                  "  [--interval SECONDS] [--timeout SECONDS] [--workers 1..16] [--mark N]\n"
                  "  [--observatory LOOPBACK_URL] [--observatory-max-age SECONDS] [--xray-config PATH]\n"
                  "  [--node-url HTTPS_URL --node-code STATUS --node-interval SECONDS --node-timeout SECONDS]\n"
-                 "  [--failover-file PATH] [--latency-file PATH]");
+                 "  [--failover-file PATH] [--latency-file PATH] [--recover-xray [--recovery-state PATH]]\n"
+                 "  [--login-file PATH] [--restore-lan-redirect [--redirect-state PATH]]");
             return 0;
         default: return 2;
         }
     }
-    if (optind != argc || (metrics && !valid_observatory_url(metrics))) {
+    if (optind != argc || (metrics && !valid_observatory_url(metrics)) ||
+        (recovery_state && (!recover_xray || *recovery_state != '/')) ||
+        (redirect_state && (!restore_redirect || *redirect_state != '/' ||
+                            (recovery_state && !strcmp(redirect_state, recovery_state))))) {
         fputs("invalid arguments or non-local Observatory URL\n", stderr);
         return 2;
+    }
+    if (recover_xray && (!core_watch_local_api(api) ||
+                        !token || !*token || !xray_config || *xray_config != '/')) {
+        fputs("Xray recovery disabled: a local HTTP API, token file and absolute core config path are required\n",
+              stderr);
+        recover_xray = 0;
+    }
+    if (restore_redirect && (!core_watch_local_api(api) || !token || *token != '/' ||
+                             !xray_config || *xray_config != '/')) {
+        fputs("LAN REDIRECT restoration disabled: a local HTTP API and absolute token and core config paths are required\n",
+              stderr);
+        restore_redirect = 0;
+    }
+    if (login_file && (!core_watch_local_api(api) ||
+                       *login_file != '/' || !token || *token != '/')) {
+        fputs("v2rayA login renewal disabled: a local HTTP API and absolute login and token paths are required\n",
+              stderr);
+        login_file = NULL;
     }
     if (curl_global_init(CURL_GLOBAL_DEFAULT) != CURLE_OK) return 1;
     if (https.url && (!xray_config || !https_target(https.url, https.host, sizeof(https.host), &https.port))) {
@@ -317,31 +410,85 @@ int main(int argc, char **argv)
         curl_global_cleanup();
         return 2;
     }
+    struct stat runtime_identity;
+    const struct stat *runtime = NULL;
+    int runtime_directory = -1;
+    char runtime_status[64], runtime_latency[64];
+    if (!strcmp(output, DEFAULT_STATUS)) {
+        runtime_directory = open_runtime_directory(&runtime_identity);
+        if (runtime_directory < 0) {
+            fputs("v2raya-helper: could not prepare private runtime directory " RUNTIME_DIR "\n", stderr);
+            curl_global_cleanup();
+            return 1;
+        }
+        runtime = &runtime_identity;
+        /* Pin the directory so a replacement cannot redirect an in-flight publication. */
+        snprintf(runtime_status, sizeof(runtime_status), "/proc/self/fd/%d/status.json", runtime_directory);
+        output = runtime_status;
+        if (latency_file && !strcmp(latency_file, DEFAULT_LATENCY)) {
+            snprintf(runtime_latency, sizeof(runtime_latency), "/proc/self/fd/%d/latency.json", runtime_directory);
+            latency_file = runtime_latency;
+        }
+    }
     signal(SIGINT, stop);
     signal(SIGTERM, stop);
     signal(SIGPIPE, SIG_IGN);
-    const struct v2raya_api v2raya = {.base = api, .token_file = token, .timeout_ms = timeout * 1000};
+    struct core_watch_peer local_peer = {.api = api, .stopping = &stopping};
+    const struct v2raya_api v2raya = {.base = api, .token_file = token, .timeout_ms = timeout * 1000,
+        .connected_peer = recover_xray || login_file || restore_redirect ? core_watch_verify_peer : NULL,
+        .peer_context = &local_peer};
     struct latency_history *history = latency_history_create(latency_file);
     uint64_t generation = ((uint64_t)probe_clock_ms() << 20) ^ (uint64_t)getpid();
     struct failover_monitor *failover = failover_monitor_create(failover_file, &v2raya, &https, mark, history);
 
+    struct core_recovery recovery = {0};
+    if (recover_xray) core_recovery_init(&recovery, recovery_state, v2raya.base, xray_config);
+    struct lan_redirect_repair redirect = {0};
+    struct lan_redirect_repair *repair = restore_redirect ? &redirect : NULL;
+    struct lan_ingress_watch ingress_watch = {0};
+    if (repair) lan_ingress_init(repair, redirect_state, api, xray_config);
+    struct login_refresh login = {.credentials_path = login_file};
     struct inventory current = {0};
     long ttl = 2 * interval + 6 * timeout + 2;
     int trusted = 0, rc = 0;
     if (https.url) ttl += 2 * https.timeout;
-    if (publish(output, &current, "starting", NULL, ttl, route_ttl, &https)) rc = 1;
+    const struct lan_ingress unobserved = {0};
+    if (publish(output, runtime, &current, "starting", NULL, ttl, route_ttl, &https, unobserved)) rc = 1;
     while (!stopping && !rc) {
+        if (!runtime_is_current(runtime)) {
+            rc = 1;
+            break;
+        }
         struct inventory next = {0};
         char err[160] = {0};
+        const char *core_status = NULL;
         int backlog = 0;
         long wait = interval;
-        if (load_inventory(api, token, xray_config, timeout * 1000, &next, err, sizeof(err)) != 0)
+        if (discover_with_login(&v2raya, xray_config, &login, &next, &stopping, err, sizeof(err)) != 0) {
+            recovery.missing_since = 0;
             goto unavailable;
+        }
         if (current.running != next.running) ++generation;
         replace_inventory(&current, &next, trusted);
+        if (recover_xray &&
+            (core_status = core_recovery_tick(&recovery, &v2raya, xray_config, current.running, &stopping))) {
+            snprintf(err, sizeof(err), "%s", core_status);
+            goto unavailable;
+        }
         if (https.url) sync_profiles(&current, xray_config, &profiles, failover, &generation);
+        struct lan_ingress ingress = {0};
+        if (current.running && xray_config && core_watch_local_api(api)) {
+            json_object *config = https.url ? json_object_get(profiles) : node_config_read(xray_config);
+            ingress = lan_ingress_observe(&v2raya, xray_config, config, &ingress_watch, repair, &stopping);
+            json_object_put(config);
+        } else if (!stopping) {
+            ingress_watch = (struct lan_ingress_watch){0};
+            lan_ingress_disarm(repair);
+        }
+        uint64_t ingress_generation = generation;
         trusted = 1;
-        if (publish(output, &current, current.running ? "ok" : "stopped", NULL, ttl, route_ttl, &https)) {
+        if (publish(output, runtime, &current, current.running ? "ok" : "stopped",
+                    NULL, ttl, route_ttl, &https, ingress)) {
             rc = 1;
             break;
         }
@@ -354,32 +501,53 @@ int main(int argc, char **argv)
                 probe_members(jobs, count, https.timeout * 1000, mark, &https, profiles);
             }
             read_observatory(metrics, &current, timeout * 1000, route_ttl);
-            if (load_inventory(api, token, xray_config, timeout * 1000, &next, err, sizeof(err)) != 0)
+            if (discover_with_login(&v2raya, xray_config, &login, &next, &stopping, err, sizeof(err)) != 0) {
+                recovery.missing_since = 0;
                 goto unavailable;
+            }
             if (current.running != next.running) ++generation;
             replace_inventory(&current, &next, 1);
+            if (!stopping && !current.running) {
+                ingress_watch = (struct lan_ingress_watch){0};
+                lan_ingress_disarm(repair);
+            }
+            if (recover_xray &&
+                (core_status = core_recovery_tick(&recovery, &v2raya, xray_config, current.running, &stopping))) {
+                snprintf(err, sizeof(err), "%s", core_status);
+                goto unavailable;
+            }
             if (https.url) sync_profiles(&current, xray_config, &profiles, failover, &generation);
             record_latency(history, &current, generation);
-            if (publish(output, &current, current.running ? "ok" : "stopped", NULL, ttl, route_ttl, &https))
+            if (publish(output, runtime, &current, current.running ? "ok" : "stopped", NULL, ttl, route_ttl, &https,
+                        generation == ingress_generation ? ingress : unobserved))
                 rc = 1;
             if (backlog) wait = 1;
         }
-        if (!stopping && !rc) failover_monitor_tick(failover, &current, xray_config, profiles);
+        if (!stopping && !rc && failover_monitor_tick(failover, &current, xray_config, profiles, &stopping))
+            wait = 1;
         goto sleep_cycle;
 unavailable:
         if (trusted) ++generation;
         trusted = 0;
+        if (!stopping) {
+            ingress_watch = (struct lan_ingress_watch){0};
+            lan_ingress_disarm(repair);
+        }
         failover_monitor_reset(failover);
-        if (publish(output, &current, "stale", err, ttl, route_ttl, &https)) rc = 1;
+        if (publish(output, runtime, &current, "stale", err, ttl, route_ttl, &https, unobserved)) rc = 1;
 sleep_cycle:
-        latency_history_publish(history, time(NULL));
+        if (!rc && runtime_is_current(runtime)) latency_history_publish(history, time(NULL));
+        else rc = 1;
         free_inventory(&next);
         if (!rc && !stopping) sleep((unsigned)wait);
     }
     free_inventory(&current);
+    lan_ingress_close(repair);
+    core_recovery_close(&recovery);
     failover_monitor_free(failover);
     latency_history_free(history);
     json_object_put(profiles);
     curl_global_cleanup();
+    if (runtime_directory >= 0) close(runtime_directory);
     return rc;
 }

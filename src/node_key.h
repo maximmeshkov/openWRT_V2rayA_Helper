@@ -5,5 +5,7 @@
  * a private subscription URL. Only expose the resulting key. */
 void node_key(char key[33], const char *type, const char *source,
               const char *name, const char *address, const char *net);
+/* First 128 bits of SHA-256 over the text, encoded as hexadecimal. */
+void text_fingerprint(char key[33], const char *text);
 
 #endif

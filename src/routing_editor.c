@@ -128,7 +128,7 @@ int routing_editor_command(int argc, char **argv)
     initialized = 1;
     if (!(version = v2raya_api_get_version(&api, error, sizeof(error))) ||
         !(document = v2raya_api_get_routing(&api, error, sizeof(error))) ||
-        load_inventory(api.base, api.token_file, NULL, api.timeout_ms, &inv, error, sizeof(error))) {
+        load_inventory(&api, NULL, &inv, error, sizeof(error))) {
         failure = *error ? error : "Cannot read RoutingA from v2rayA";
         goto done;
     }

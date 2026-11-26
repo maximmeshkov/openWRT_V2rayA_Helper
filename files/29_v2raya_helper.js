@@ -1,9 +1,7 @@
 'use strict';
 'require baseclass';
 'require rpc';
-'require request';
-'require session';
-'require ui';
+'require v2raya-helper.menu as helperMenu';
 
 var readStatus = rpc.declare({
 	object: 'v2raya-helper',
@@ -11,44 +9,6 @@ var readStatus = rpc.declare({
 	expect: { '': {} },
 	reject: true
 });
-
-var checkedMenu = false;
-var menuRefreshKey = 'v2raya-helper-menu-refreshed';
-
-function helperPages(tree) {
-	var admin = tree && tree.children && tree.children.admin;
-	var services = admin && admin.children && admin.children.services;
-	var helper = services && services.children && services.children['v2raya-helper'];
-	if (!helper || !helper.satisfied || !helper.children)
-		return [];
-	return ['routinga', 'failover', 'latency'].filter(function(name) {
-		return helper.children[name] && helper.children[name].satisfied;
-	});
-}
-
-/* LuCI reuses a per-session menu across package upgrades. Check the current
- * menu once from Overview and refresh only when an accessible page is missing. */
-function refreshHelperMenu() {
-	if (checkedMenu || !ui.menu || typeof ui.menu.flushCache !== 'function')
-		return;
-	checkedMenu = true;
-	ui.menu.load().then(function(menu) {
-		var available = helperPages(menu);
-		if (available.length === 3) {
-			session.setLocalData(menuRefreshKey, null);
-			return;
-		}
-		if (session.getLocalData(menuRefreshKey))
-			return;
-		return request.get(L.url('admin/menu')).then(function(reply) {
-			if (helperPages(reply.json()).some(function(name) { return available.indexOf(name) < 0; }) &&
-			    session.setLocalData(menuRefreshKey, true)) {
-				ui.menu.flushCache();
-				window.location.reload();
-			}
-		});
-	}).catch(function() {});
-}
 
 function textCell(label, value, span) {
 	return E('td', { 'class': 'td', 'data-title': label, 'rowspan': span || 1 }, [value]);
@@ -111,7 +71,7 @@ return baseclass.extend({
 		// A transient rpcd error must not make LuCI drop the include from later polls.
 		return readStatus().then(function(reply) {
 			if (reply && reply.snapshot)
-				refreshHelperMenu();
+				helperMenu.refresh();
 			return reply;
 		}).catch(function() { return {}; });
 	},
@@ -127,6 +87,37 @@ return baseclass.extend({
 		var fresh = snapshot.state === 'ok' && inTime;
 		var items = Array.isArray(snapshot.outbounds) ? snapshot.outbounds : [];
 		var content = E('div');
+		var ingress = fresh && snapshot.lan_ingress;
+		if (ingress && ingress.mode === 'redirect') {
+			var missing = [];
+			if (ingress.ipv4 === 'missing')
+				missing.push('IPv4');
+			if (ingress.ipv6 === 'missing')
+				missing.push('IPv6');
+			if (missing.length) {
+				var message = ingress.reason === 'table_missing' ?
+					_('LAN redirect table missing (%s)') : _('LAN redirect rule missing (%s)');
+				content.appendChild(E('p', { 'class': 'alert-message warning' },
+					[message.format(missing.join(', '))]));
+			}
+		}
+		if (ingress && ingress.mode === 'tproxy') {
+			var reasons = {
+				hook_missing: _('LAN TPROXY interception rule missing (%s)'),
+				policy_missing: _('LAN TPROXY policy rule missing (%s)'),
+				local_route_missing: _('LAN TPROXY local route missing (%s)')
+			};
+			Object.keys(reasons).forEach(function(reason) {
+				var missingFamilies = [];
+				if (ingress.ipv4 === 'missing' && ingress.ipv4_reason === reason)
+					missingFamilies.push('IPv4');
+				if (ingress.ipv6 === 'missing' && ingress.ipv6_reason === reason)
+					missingFamilies.push('IPv6');
+				if (missingFamilies.length)
+					content.appendChild(E('p', { 'class': 'alert-message warning' },
+						[reasons[reason].format(missingFamilies.join(', '))]));
+			});
+		}
 		if (!fresh) {
 			var notices = {
 				starting: _('Waiting for the first reading'),
