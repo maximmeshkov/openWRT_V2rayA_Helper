@@ -102,7 +102,7 @@ static int same_assignment(const struct outbound *a, const struct outbound *b)
     for (size_t j = 0; j < a->count; ++j) {
         const struct member *x = &a->members[j], *y = &b->members[j];
         if (strcmp(x->name, y->name) || strcmp(x->address, y->address) ||
-            strcmp(x->display_net, y->display_net) || x->node_id != y->node_id ||
+            strcmp(x->display_net, y->display_net) || strcmp(x->transport, y->transport) || x->node_id != y->node_id ||
             x->subscription != y->subscription || x->selected != y->selected)
             return 0;
     }
@@ -188,14 +188,14 @@ static long number(const char *s, unsigned long min, unsigned long max)
 int main(int argc, char **argv)
 {
     const char *api = "http://127.0.0.1:2017", *token = NULL, *metrics = NULL;
-    const char *output = "/var/run/v2raya-helper/status.json";
+    const char *output = "/var/run/v2raya-helper/status.json", *xray_config = NULL;
     long interval = 10, timeout = 3, workers = 2, route_ttl = 60;
     uint32_t mark = 0x80;
     static const struct option options[] = {
         {"api",1,0,'a'}, {"token-file",1,0,'t'}, {"observatory",1,0,'o'},
         {"output",1,0,'f'}, {"interval",1,0,'i'}, {"timeout",1,0,'d'},
         {"workers",1,0,'w'}, {"mark",1,0,'m'}, {"observatory-max-age",1,0,'e'},
-        {"help",0,0,'h'}, {0,0,0,0}
+        {"xray-config",1,0,'x'}, {"help",0,0,'h'}, {0,0,0,0}
     };
     int opt;
     while ((opt = getopt_long(argc, argv, "", options, NULL)) != -1) {
@@ -209,10 +209,11 @@ int main(int argc, char **argv)
         case 'w': workers = number(optarg, 1, 16); break;
         case 'm': mark = (uint32_t)number(optarg, 0, UINT32_MAX); break;
         case 'e': route_ttl = number(optarg, 1, 86400); break;
+        case 'x': xray_config = optarg; break;
         case 'h':
             puts("v2raya-helper [--api URL] [--token-file PATH] [--output PATH]\n"
                  "  [--interval SECONDS] [--timeout SECONDS] [--workers 1..16] [--mark N]\n"
-                 "  [--observatory LOOPBACK_URL] [--observatory-max-age SECONDS]");
+                 "  [--observatory LOOPBACK_URL] [--observatory-max-age SECONDS] [--xray-config PATH]");
             return 0;
         default: return 2;
         }
@@ -235,7 +236,7 @@ int main(int argc, char **argv)
         char err[160] = {0};
         int backlog = 0;
         long wait = interval;
-        if (load_inventory(api, token, timeout * 1000, &next, err, sizeof(err)) != 0)
+        if (load_inventory(api, token, xray_config, timeout * 1000, &next, err, sizeof(err)) != 0)
             goto unavailable;
         replace_inventory(&current, &next, trusted);
         trusted = 1;
@@ -248,7 +249,7 @@ int main(int argc, char **argv)
             size_t count = pick_jobs(&current, jobs, (size_t)workers, interval, &backlog);
             probe_members(jobs, count, timeout * 1000, mark);
             read_observatory(metrics, &current, timeout * 1000, route_ttl);
-            if (load_inventory(api, token, timeout * 1000, &next, err, sizeof(err)) != 0)
+            if (load_inventory(api, token, xray_config, timeout * 1000, &next, err, sizeof(err)) != 0)
                 goto unavailable;
             replace_inventory(&current, &next, 1);
             if (publish(output, &current, current.running ? "ok" : "stopped", NULL, ttl, route_ttl))

@@ -14,7 +14,8 @@ struct measurement {
 };
 
 struct member {
-    char *name, *address, *transport;
+    char *name, *address;
+    const char *transport;
     char *display_net;
     int64_t node_id, subscription;
     int selected;
@@ -35,7 +36,7 @@ struct inventory {
     size_t count;
 };
 
-int load_inventory(const char *api, const char *token_file, long timeout_ms,
+int load_inventory(const char *api, const char *token_file, const char *xray_config, long timeout_ms,
                    struct inventory *out, char *error, size_t error_len);
 void free_inventory(struct inventory *inv);
 json_object *fetch_json(const char *url, const char *token, long timeout_ms,

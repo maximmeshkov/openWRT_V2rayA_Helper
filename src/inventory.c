@@ -4,14 +4,21 @@
 #include <arpa/inet.h>
 #include <ctype.h>
 #include <curl/curl.h>
+#include <fcntl.h>
+#include <ifaddrs.h>
+#include <net/if.h>
+#include <netdb.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #define RESPONSE_LIMIT (8u * 1024u * 1024u)
 #define TOKEN_LIMIT 16384
+#define BIND_HOST_LEN (sizeof("host!") + INET6_ADDRSTRLEN + IF_NAMESIZE)
 
 struct response_body {
 	char *bytes;
@@ -43,8 +50,40 @@ static size_t receive_body(char *p, size_t size, size_t count, void *arg)
 	return n;
 }
 
+// Pin plaintext API connections to the same numeric address on this machine.
+static int own_address(int family, const void *ip, char *bind_host)
+{
+	struct ifaddrs *addresses;
+	if (getifaddrs(&addresses))
+		return 0;
+	int found = 0;
+	for (struct ifaddrs *it = addresses; it; it = it->ifa_next) {
+		if (!it->ifa_addr || it->ifa_addr->sa_family != family)
+			continue;
+		if (family == AF_INET) {
+			const struct sockaddr_in *v4 = (const struct sockaddr_in *)it->ifa_addr;
+			if (memcmp(ip, &v4->sin_addr, sizeof(v4->sin_addr)))
+				continue;
+		} else {
+			const struct sockaddr_in6 *v6 = (const struct sockaddr_in6 *)it->ifa_addr;
+			if (memcmp(ip, &v6->sin6_addr, sizeof(v6->sin6_addr)))
+				continue;
+		}
+		found = 1;
+		if (bind_host) {
+			memcpy(bind_host, "host!", 5);
+			socklen_t size = family == AF_INET ? sizeof(struct sockaddr_in) : sizeof(struct sockaddr_in6);
+			found = !getnameinfo(it->ifa_addr, size, bind_host + 5, BIND_HOST_LEN - 5,
+			                     NULL, 0, NI_NUMERICHOST);
+		}
+		break;
+	}
+	freeifaddrs(addresses);
+	return found;
+}
+
 // Verify the API origin before reading or sending any token.
-static int valid_url(const char *base, int loopback_only)
+static int valid_url(const char *base, int loopback_only, char *bind_host)
 {
 	CURLU *u = curl_url();
 	char *scheme = NULL, *host = NULL;
@@ -58,8 +97,17 @@ static int valid_url(const char *base, int loopback_only)
 		valid = 1;
 	} else if (!strcmp(scheme, "http") || !strcmp(scheme, "https")) {
 		struct in_addr ipv4;
-		valid = strcmp(host, "[::1]") == 0 ||
-		        (inet_pton(AF_INET, host, &ipv4) == 1 && (ntohl(ipv4.s_addr) >> 24) == 127);
+		struct in6_addr ipv6;
+		size_t len = strlen(host);
+		if (inet_pton(AF_INET, host, &ipv4) == 1) {
+			valid = (ntohl(ipv4.s_addr) >> 24) == 127 ||
+			        (!loopback_only && own_address(AF_INET, &ipv4, bind_host));
+		} else if (len > 2 && host[0] == '[' && host[len-1] == ']') {
+			host[len-1] = '\0';
+			if (inet_pton(AF_INET6, host + 1, &ipv6) == 1)
+				valid = IN6_IS_ADDR_LOOPBACK(&ipv6) ||
+				        (!loopback_only && own_address(AF_INET6, &ipv6, bind_host));
+		}
 	}
 done:
 	curl_free(scheme);
@@ -70,7 +118,7 @@ done:
 
 int valid_observatory_url(const char *url)
 {
-	return valid_url(url, 1);
+	return valid_url(url, 1, NULL);
 }
 
 static int read_token(const char *path, char token[TOKEN_LIMIT + 2])
@@ -113,8 +161,9 @@ static const char *field_text(json_object *obj, const char *key)
 
 json_object *fetch_json(const char *url, const char *token, long timeout_ms, char *error, size_t error_len)
 {
-	if (!valid_url(url, 0) || timeout_ms <= 0) {
-		snprintf(error, error_len, "invalid URL or timeout; use HTTPS or a loopback HTTP IP");
+	char bind_host[BIND_HOST_LEN] = "";
+	if (!valid_url(url, 0, bind_host) || timeout_ms <= 0) {
+		snprintf(error, error_len, "invalid URL or timeout; use HTTPS or this router's numeric HTTP IP");
 		return NULL;
 	}
 	struct curl_slist *headers = NULL;
@@ -142,9 +191,10 @@ json_object *fetch_json(const char *url, const char *token, long timeout_ms, cha
 	json_object *root = NULL;
 	/* Control-plane reads run on the main thread, outside the probe batch.
 	 * For remote HTTPS on a synchronous libcurl, allow its DNS timeout. */
-	long no_signal = valid_observatory_url(url) ||
+	long no_signal = *bind_host || valid_observatory_url(url) ||
 		(curl_version_info(CURLVERSION_NOW)->features & CURL_VERSION_ASYNCHDNS);
 	if (!curl || curl_easy_setopt(curl, CURLOPT_URL, url) ||
+	    (*bind_host && curl_easy_setopt(curl, CURLOPT_INTERFACE, bind_host)) ||
 	    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers) ||
 	    curl_easy_setopt(curl, CURLOPT_PROXY, "") || curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 0L) ||
 	    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, no_signal) || curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, timeout_ms) ||
@@ -253,7 +303,6 @@ void free_inventory(struct inventory *inv)
 		for (size_t j = 0; j < o->count; j++) {
 			free(o->members[j].name);
 			free(o->members[j].address);
-			free(o->members[j].transport);
 			free(o->members[j].display_net);
 		}
 		free(o->members);
@@ -293,7 +342,7 @@ static int add_member(struct outbound *out, json_object *server, json_object *re
 	json_object *selected = NULL;
 	json_object_object_get_ex(ref, "selected", &selected);
 	*m = (struct member){
-		.name = strdup(name), .address = strdup(address), .transport = strdup(server_transport(net)),
+		.name = strdup(name), .address = strdup(address), .transport = server_transport(net),
 		.display_net = strdup(net), .node_id = field_int(ref, "id"),
 		.subscription = !strcmp(field_text(ref, "_type"), "server") ? -1 : field_int(ref, "sub"),
 		.selected = json_object_is_type(selected, json_type_boolean) && json_object_get_boolean(selected)
@@ -363,12 +412,165 @@ static int parse_inventory(json_object *names_data, json_object *touch_data, str
 	return 0;
 }
 
-int load_inventory(const char *api, const char *token_file, long timeout_ms,
+static json_object *read_core_config(const char *path)
+{
+	int fd = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+	if (fd < 0)
+		return NULL;
+	struct stat before, after;
+	json_object *config = NULL;
+	if (!fstat(fd, &before) && S_ISREG(before.st_mode) && before.st_size > 0 &&
+	    before.st_size <= RESPONSE_LIMIT) {
+		size_t len = (size_t)before.st_size, used = 0;
+		char *bytes = malloc(len);
+		while (bytes && used < len) {
+			ssize_t n = read(fd, bytes + used, len - used);
+			if (n <= 0)
+				break;
+			used += (size_t)n;
+		}
+		if (used == len && !stat(path, &after) && before.st_dev == after.st_dev &&
+		    before.st_ino == after.st_ino && before.st_size == after.st_size &&
+		    before.st_ctim.tv_sec == after.st_ctim.tv_sec && before.st_ctim.tv_nsec == after.st_ctim.tv_nsec) {
+			json_tokener *tok = json_tokener_new();
+			if (tok) {
+				json_tokener_set_flags(tok, JSON_TOKENER_STRICT);
+				config = json_tokener_parse_ex(tok, bytes, (int)len);
+				json_tokener_free(tok);
+			}
+		}
+		free(bytes);
+	}
+	close(fd);
+	return config;
+}
+
+static json_object *unique_tag(json_object *array, const char *tag)
+{
+	json_object *found = NULL;
+	if (json_object_is_type(array, json_type_array))
+		for (size_t i = 0; i < json_object_array_length(array); i++) {
+			json_object *entry = json_object_array_get_idx(array, i);
+			const char *name = field_text(entry, "tag");
+			if (!name || strcmp(name, tag))
+				continue;
+			if (found)
+				return NULL;
+			found = entry;
+		}
+	return found;
+}
+
+static json_object *core_outbound(json_object *config, const struct outbound *out, const struct member *m)
+{
+	json_object *outbounds = json_object_object_get(config, "outbounds");
+	if (out->count == 1)
+		return unique_tag(outbounds, out->name);
+
+	// v2rayA wraps the member's name in the balancer selector. Only accept
+	// an exact and unique membership, including when two servers share an IP.
+	for (size_t j = 0; j < out->count; j++)
+		if (m != &out->members[j] && !strcmp(out->members[j].name, m->name))
+			return NULL;
+	json_object *routing = json_object_object_get(config, "routing");
+	json_object *balancer = unique_tag(json_object_object_get(routing, "balancers"), out->name);
+	json_object *selector = json_object_object_get(balancer, "selector");
+	if (!json_object_is_type(selector, json_type_array))
+		return NULL;
+	const char *tag = NULL;
+	size_t len = strlen(m->name);
+	for (size_t i = 0; i < json_object_array_length(selector); i++) {
+		const char *candidate = json_text(json_object_array_get_idx(selector, i));
+		if (candidate && strlen(candidate) == len + sizeof("『』") - 1 &&
+		    !strncmp(candidate, "『", sizeof("『") - 1) &&
+		    !memcmp(candidate + sizeof("『") - 1, m->name, len) &&
+		    !strcmp(candidate + sizeof("『") - 1 + len, "』")) {
+			if (tag)
+				return NULL;
+			tag = candidate;
+		}
+	}
+	return tag ? unique_tag(outbounds, tag) : NULL;
+}
+
+static int same_core_endpoint(const char *api_address, json_object *core)
+{
+	const char *addr = field_text(core, "address");
+	int64_t port = field_int(core, "port");
+	if (!addr || !*addr || port < 1 || port > 65535)
+		return 0;
+	char suffix[8];
+	snprintf(suffix, sizeof(suffix), ":%u", (unsigned)port);
+	size_t len = strlen(addr), api_len = strlen(api_address), suffix_len = strlen(suffix);
+	if (strchr(addr, ':'))
+		return api_len == len + 2 + suffix_len && api_address[0] == '[' &&
+		       !strncasecmp(api_address+1, addr, len) && api_address[len+1] == ']' &&
+		       !strcmp(api_address + len + 2, suffix);
+	return api_len == len + suffix_len && !strncasecmp(api_address, addr, len) &&
+	       !strcmp(api_address + len, suffix);
+}
+
+static const char *xhttp_transport(json_object *core, const struct member *m)
+{
+	const char *protocol = field_text(core, "protocol");
+	json_object *settings = json_object_object_get(core, "settings");
+	json_object *servers = json_object_object_get(settings, "vnext");
+	json_object *stream = json_object_object_get(core, "streamSettings");
+	const char *network = field_text(stream, "network");
+	if (!protocol || (strcmp(protocol, "vless") && strcmp(protocol, "vmess")) || !network ||
+	    (strcmp(network, "xhttp") && strcmp(network, "splithttp")) ||
+	    !json_object_is_type(servers, json_type_array) || json_object_array_length(servers) != 1 ||
+	    !same_core_endpoint(m->address, json_object_array_get_idx(servers, 0)))
+		return "unknown";
+	json_object *sec = NULL;
+	const char *security = json_object_object_get_ex(stream, "security", &sec) ? json_text(sec) : "";
+	if (!security || (*security && strcmp(security, "none") && strcmp(security, "tls") && strcmp(security, "reality")))
+		return "unknown";
+	if (!strcmp(security, "none")) security = "";
+	char expected[40];
+	snprintf(expected, sizeof(expected), "%s(%s%s%s)", protocol, network, *security ? "+" : "", security);
+	if (strcasecmp(expected, m->display_net))
+		return "unknown";
+	if (strcmp(security, "tls"))
+		return "tcp";
+	// Xray's XHTTP dialer chooses QUIC only for the singleton ALPN ["h3"].
+	json_object *tls = json_object_object_get(stream, "tlsSettings"), *alpn = NULL;
+	if (tls && !json_object_is_type(tls, json_type_object))
+		return "unknown";
+	if (!json_object_object_get_ex(tls, "alpn", &alpn)) return "tcp";
+	if (!json_object_is_type(alpn, json_type_array)) return "unknown";
+	for (size_t i = 0; i < json_object_array_length(alpn); i++) {
+		const char *s = json_text(json_object_array_get_idx(alpn, i));
+		if (!s) return "unknown";
+		if (json_object_array_length(alpn) == 1 && !strcmp(s, "h3")) return "quic";
+	}
+	return "tcp";
+}
+
+static void refine_xhttp(struct inventory *inv, const char *path)
+{
+	json_object *core = NULL;
+	for (size_t i = 0; i < inv->count; i++) {
+		struct outbound *out = &inv->outbounds[i];
+		for (size_t j = 0; j < out->count; j++) {
+			struct member *m = &out->members[j];
+			const char *net = strchr(m->display_net, '(');
+			if (!net || (strncasecmp(net, "(xhttp", 6) && strncasecmp(net, "(splithttp", 10)))
+				continue;
+			if (!core && !(core = read_core_config(path)))
+				return;
+			m->transport = xhttp_transport(core_outbound(core, out, m), m);
+		}
+	}
+	json_object_put(core);
+}
+
+int load_inventory(const char *api, const char *token_file, const char *xray_config, long timeout_ms,
                    struct inventory *out, char *error, size_t error_len)
 {
 	*out = (struct inventory){0};
-	if (!valid_url(api, 0) || timeout_ms <= 0) {
-		snprintf(error, error_len, "invalid v2rayA URL or timeout; use HTTPS or a loopback HTTP IP");
+	if (!valid_url(api, 0, NULL) || timeout_ms <= 0) {
+		snprintf(error, error_len, "invalid v2rayA URL or timeout; use HTTPS or this router's numeric HTTP IP");
 		return -1;
 	}
 	char token[TOKEN_LIMIT + 2];
@@ -389,6 +591,8 @@ int load_inventory(const char *api, const char *token_file, long timeout_ms,
 		free_inventory(out);
 		goto done;
 	}
+	if (out->running && xray_config)
+		refine_xhttp(out, xray_config);
 	rc = 0;
 done:
 	json_object_put(names);

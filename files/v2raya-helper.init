@@ -3,10 +3,26 @@
 START=99
 USE_PROCD=1
 
+local_api() {
+	local address
+	address="$(uci -q get v2raya.config.address)"
+	address="${address:-0.0.0.0:2017}"
+	case "$address" in
+		0.0.0.0:*|:*|localhost:*) address="127.0.0.1:${address##*:}" ;;
+		'[::]:'*) address="[::1]:${address##*:}" ;;
+	esac
+	printf 'http://%s\n' "$address"
+}
+
 start_service() {
-	local api interval timeout workers mark token_file observatory observatory_max_age
+	local api xray_config interval timeout workers mark token_file observatory observatory_max_age
 	config_load v2raya_helper
-	config_get api main api 'http://127.0.0.1:2017'
+	config_get api main api
+	config_get xray_config main xray_config
+	if [ -z "$api" ]; then
+		api="$(local_api)"
+		xray_config="${xray_config:-/etc/v2raya/config.json}"
+	fi
 	config_get interval main interval 10
 	config_get timeout main timeout 3
 	config_get workers main workers 2
@@ -22,6 +38,7 @@ start_service() {
 		--timeout "$timeout" --workers "$workers" --mark "$mark" \
 		--output /var/run/v2raya-helper/status.json
 	[ -z "$token_file" ] || procd_append_param command --token-file "$token_file"
+	[ -z "$xray_config" ] || procd_append_param command --xray-config "$xray_config"
 	[ -z "$observatory" ] || procd_append_param command --observatory "$observatory"
 	[ -z "$observatory_max_age" ] || procd_append_param command --observatory-max-age "$observatory_max_age"
 	procd_set_param respawn
@@ -30,5 +47,5 @@ start_service() {
 }
 
 service_triggers() {
-	procd_add_reload_trigger v2raya_helper
+	procd_add_reload_trigger v2raya_helper v2raya
 }

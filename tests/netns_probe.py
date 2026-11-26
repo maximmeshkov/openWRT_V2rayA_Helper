@@ -1,5 +1,6 @@
 """Usage: sudo python3 tests/netns_probe.py BINARY [--dns-only]"""
 import contextlib
+from http.server import ThreadingHTTPServer
 import json
 import os
 from pathlib import Path
@@ -7,6 +8,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 
 from test_monitor import APIFixture, assignment, profile, server_state
@@ -99,6 +101,44 @@ def test_dns_deadline(binary, tmp, api, target_port, *, check_mark):
                   "numeric peer remained healthy and no child worker remained.")
 
 
+def test_router_local_api(binary, tmp, api):
+    address = "192.0.2.7"
+    subprocess.run(["ip", "addr", "add", address + "/32", "dev", "lo"], check=True)
+
+    class LocalOnly(ThreadingHTTPServer):
+        def verify_request(self, request, client_address):
+            return client_address[0] == address
+
+    path = tmp / "local-api.json"
+    with LocalOnly((address, 0), api.http.RequestHandlerClass) as http:
+        url = f"http://{address}:{http.server_port}"
+        thread = threading.Thread(target=http.serve_forever, daemon=True)
+        thread.start()
+        try:
+            token = tmp / "local-api.token"
+            token.write_text("local-fixture-token")
+            api.token = token.read_text()
+            with monitor(binary, api, path, "--api", url + "/ui", "--token-file", str(token)) as proc:
+                wait_for_state(proc, path, "ok", lambda: None)
+            assert subprocess.run([binary, "--observatory", url + "/debug/vars"],
+                                  capture_output=True, timeout=3).returncode == 2
+        finally:
+            api.token = None
+            http.shutdown()
+            thread.join()
+    # An unassigned address must fail origin validation before even reading a token.
+    path = tmp / "foreign-api.json"
+    with monitor(binary, api, path, "--api", "http://192.0.2.8", "--token-file", str(tmp/"missing")):
+        deadline = time.monotonic() + 4
+        while time.monotonic() < deadline:
+            if path.exists() and "invalid v2rayA URL" in json.loads(path.read_text()).get("message", ""):
+                break
+            time.sleep(0.02)
+        else:
+            raise AssertionError("accepted an unassigned plaintext API origin")
+    print("Own LAN IPv4 API accepted with matching source and token; external HTTP and LAN metrics rejected.")
+
+
 def isolated_test(binary, original_netns, original_mountns, dns_only):
     # Both assertions run before *any* link, firewall or mount change.
     for fd, ns in ((original_netns, "net"), (original_mountns, "mnt")):
@@ -176,6 +216,7 @@ table inet v2raya_probe_test {{
         exchange()
         print(f"Unmarked SYN rejected; {accepted} default-mark TCP probes accepted. "
               f"One application connection completed {exchanges} request/reply exchanges.")
+        test_router_local_api(binary, tmp, api)
         test_dns_deadline(binary, tmp, api, port, check_mark=True)
 
 
