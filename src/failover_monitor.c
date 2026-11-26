@@ -1,0 +1,300 @@
+#define _GNU_SOURCE
+#include "failover_monitor.h"
+#include "failover_api.h"
+#include "failover_policy.h"
+#include "failover_profile.h"
+#include "node_profile.h"
+#include <errno.h>
+#include <fcntl.h>
+#include <poll.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/file.h>
+#include <sys/prctl.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+struct status {
+    struct failover_streak streak;
+    size_t next_candidate;
+    time_t tried_sample;
+};
+
+struct failover_monitor {
+    const char *path;
+    char *lock_path, *last_path;
+    struct v2raya_api api;
+    struct https_options https;
+    uint32_t mark;
+    json_object *settings;
+    struct status *rows;
+    size_t count;
+};
+
+int failover_lock_settings(const char *path)
+{
+    int fd = open(path, O_WRONLY | O_CREAT | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK, 0600);
+    if (fd >= 0 && flock(fd, LOCK_EX | LOCK_NB) < 0) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+struct failover_monitor *failover_monitor_create(const char *path, const struct v2raya_api *api,
+    const struct https_options *https, uint32_t mark)
+{
+    if (!path || !https->url) return NULL;
+    struct failover_monitor *m = calloc(1, sizeof(*m));
+    if (!m) return NULL;
+    m->path = path;
+    m->api = *api;
+    m->https = *https;
+    m->mark = mark;
+    if (asprintf(&m->lock_path, "%s.lock", path) < 0 ||
+        asprintf(&m->last_path, "%s.last", path) < 0) {
+        failover_monitor_free(m);
+        return NULL;
+    }
+    return m;
+}
+
+void failover_monitor_free(struct failover_monitor *m)
+{
+    if (!m) return;
+    free(m->lock_path);
+    free(m->last_path);
+    free(m->rows);
+    json_object_put(m->settings);
+    free(m);
+}
+
+void failover_monitor_reset(struct failover_monitor *m)
+{
+    if (m && m->rows) memset(m->rows, 0, m->count * sizeof(*m->rows));
+}
+
+static json_object *reload_policies(struct failover_monitor *m)
+{
+    json_object *settings = failover_settings_read(m->path);
+    if (!settings) {
+        failover_monitor_reset(m);
+        return NULL;
+    }
+    if (!m->settings || !json_object_equal(settings, m->settings)) {
+        json_object *policies = json_object_object_get(settings, "policies");
+        size_t count = json_object_array_length(policies);
+        struct status *rows = count ? calloc(count, sizeof(*rows)) : NULL;
+        if (count && !rows) {
+            json_object_put(settings);
+            return NULL;
+        }
+        free(m->rows);
+        m->rows = rows;
+        m->count = count;
+        json_object_put(m->settings);
+        m->settings = settings;
+    } else json_object_put(settings);
+    return json_object_object_get(m->settings, "policies");
+}
+
+static time_t last_attempt(const char *path, time_t now)
+{
+    int fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+    if (fd < 0) return errno == ENOENT ? 0 : -1;
+    char buffer[64];
+    ssize_t n = read(fd, buffer, sizeof(buffer) - 1);
+    close(fd);
+    if (n <= 0 || n >= (ssize_t)sizeof(buffer)-1) return -1;
+    buffer[n] = '\0';
+    char *end, *tail;
+    errno = 0;
+    long long value = strtoll(buffer, &end, 10);
+    if (errno || *end != ' ' || value <= 0) return -1;
+    long long unblock = strtoll(end+1, &tail, 10);
+    if (errno || tail != buffer+n-1 || *tail != '\n' || unblock < value || unblock-value > 86400)
+        return -1;
+    /* Even a shorter policy on another outbound must honor this pause. */
+    return now < (time_t)unblock ? -1 : (time_t)value;
+}
+
+static int record_attempt(const char *path, time_t when, unsigned cooldown)
+{
+    char *temp = NULL;
+    if (asprintf(&temp, "%s.XXXXXX", path) < 0) return -1;
+    int fd = mkstemp(temp);
+    int rc = -1;
+    if (fd >= 0) {
+        int written = dprintf(fd, "%lld %lld\n", (long long)when, (long long)when+cooldown);
+        if (written > 0 && fsync(fd)) written = -1;
+        if (!close(fd) && written > 0) rc = rename(temp, path);
+        if (rc) unlink(temp);
+    }
+    free(temp);
+    return rc;
+}
+
+static const struct member *active_member(const struct inventory *inv, const char *name)
+{
+    for (size_t i = 0; i < inv->count; i++)
+        if (inv->outbounds[i].count == 1 && !strcmp(inv->outbounds[i].name, name))
+            return &inv->outbounds[i].members[0];
+    return NULL;
+}
+
+static enum failover_probe_state classify(const struct measurement *sample, long http_code)
+{
+    if (!sample->state || !sample->detail) return FAILOVER_UNKNOWN;
+    if (!strcmp(sample->state, "ok")) return FAILOVER_OK;
+    if (http_code || (strcmp(sample->state, "timeout") && strcmp(sample->state, "error")))
+        return FAILOVER_UNKNOWN;
+    if (!strcmp(sample->state, "timeout") || !strcmp(sample->detail, "https_timeout") ||
+        !strcmp(sample->detail, "xhttp_session_failed") || !strcmp(sample->detail, "https_connect_error") ||
+        !strcmp(sample->detail, "https_proxy_error"))
+        return FAILOVER_FAILED;
+    return FAILOVER_UNKNOWN;
+}
+
+static struct failover_sample probe_candidate(struct failover_monitor *m, const char *link)
+{
+    struct failover_sample result = {0};
+    struct failover_profile profile = {0};
+    if (failover_profile_parse(link, &profile)) return result;
+    int channel[2];
+    if (pipe2(channel, O_CLOEXEC | O_NONBLOCK) < 0) goto done;
+    pid_t parent = getpid(), child = fork();
+    if (!child) {
+        close(channel[0]);
+        if (prctl(PR_SET_PDEATHSIG, SIGKILL) < 0 || getppid() != parent) _exit(1);
+        long code = 0;
+        struct measurement sample = probe_https_profile(&profile.node, &m->https, m->mark, &code);
+        struct failover_sample data = {.state = classify(&sample, code), .ms = sample.ms, .checked = sample.checked};
+        _exit(write(channel[1], &data, sizeof(data)) == sizeof(data) ? 0 : 1);
+    }
+    close(channel[1]);
+    if (child > 0) {
+        struct pollfd ready = {.fd = channel[0], .events = POLLIN};
+        if (poll(&ready, 1, (int)(m->https.timeout * 1000 + 50)) <= 0 ||
+            read(channel[0], &result, sizeof(result)) != sizeof(result)) {
+            result = (struct failover_sample){0};
+            kill(child, SIGKILL);
+        }
+        while (waitpid(child, NULL, 0) < 0 && errno == EINTR) {}
+    }
+    close(channel[0]);
+done:
+    failover_profile_clear(&profile);
+    return result;
+}
+
+struct switch_gate {
+    struct failover_monitor *monitor;
+    const struct failover_policy *policy;
+    struct status *status;
+    const struct failover_sample *active, *candidate;
+    long max_age;
+    int attempted;
+};
+
+static int permit_switch(void *opaque)
+{
+    struct switch_gate *gate = opaque;
+    time_t now = time(NULL), last = last_attempt(gate->monitor->last_path, now);
+    if (last < 0 ||
+        !failover_policy_choose(gate->policy, gate->active, &gate->status->streak,
+                                gate->candidate, 1, now, gate->max_age, last) ||
+        record_attempt(gate->monitor->last_path, now, gate->policy->cooldown_seconds))
+        return 0;
+    gate->attempted = 1;
+    return 1;
+}
+
+static int switch_candidate(struct failover_monitor *m, const struct failover_policy *policy,
+    struct status *status, const struct member *member, const struct failover_sample *active, long max_age)
+{
+    char error[160] = {0};
+    struct failover_catalogue catalog = {0};
+    int attempted = 0;
+    if (failover_catalogue_read(&m->api, &catalog, error, sizeof(error)) || !catalog.running)
+        goto done;
+    const struct failover_node *current = NULL;
+    for (size_t i = 0; i < catalog.count; i++) {
+        const struct failover_node *node = &catalog.nodes[i];
+        if (node->id == member->node_id && node->sub == member->subscription &&
+            !strcmp(node->name, member->name) && !strcmp(node->address, member->address) &&
+            !strcmp(node->net, member->display_net)) current = node;
+    }
+    if (!current) goto done;
+    size_t count = json_object_array_length(policy->candidates);
+    for (size_t i = 0; i < count; i++) {
+        size_t index = status->next_candidate++ % count;
+        const char *key = json_object_get_string(json_object_array_get_idx(policy->candidates, index));
+        const struct failover_node *candidate = failover_catalogue_find(&catalog, key);
+        if (!candidate || (candidate->id == current->id && candidate->sub == current->sub))
+            continue;
+        char *link = failover_api_profile(&m->api, candidate, error, sizeof(error));
+        if (!link) continue;
+        struct failover_sample result = probe_candidate(m, link);
+        result.id = key;
+        int lock = failover_lock_settings(m->lock_path);
+        if (lock >= 0) {
+            json_object *fresh = failover_settings_read(m->path);
+            time_t now = time(NULL), last = last_attempt(m->last_path, now);
+            if (fresh && last >= 0 && json_object_equal(fresh, m->settings) &&
+                failover_policy_choose(policy, active, &status->streak, &result, 1, now, max_age, last)) {
+                struct switch_gate gate = {m, policy, status, active, &result, max_age, 0};
+                int rc = failover_api_connect(&m->api, policy->outbound, current, candidate, link,
+                                               permit_switch, &gate, error, sizeof(error));
+                attempted = gate.attempted;
+                if (attempted) {
+                    fprintf(stderr, "v2raya-helper: automatic server switch %s\n",
+                            rc ? "was not confirmed" : "was confirmed");
+                    failover_monitor_reset(m);
+                }
+            }
+            json_object_put(fresh);
+            close(lock);
+        }
+        free(link);
+        break;
+    }
+done:
+    failover_catalogue_free(&catalog);
+    return attempted;
+}
+
+void failover_monitor_tick(struct failover_monitor *m, const struct inventory *inv)
+{
+    if (!m) return;
+    if (!inv || !inv->running) {
+        failover_monitor_reset(m);
+        return;
+    }
+    json_object *policies = reload_policies(m);
+    if (!policies || !m->count) return;
+    long max_age = 2 * m->https.interval + m->https.timeout;
+    time_t now = time(NULL), last = last_attempt(m->last_path, now);
+    for (size_t i = 0; i < m->count; i++) {
+        struct failover_policy policy;
+        if (failover_policy_parse(json_object_array_get_idx(policies, i), &policy) ||
+            policy.mode == FAILOVER_OFF) continue;
+        struct status *status = &m->rows[i];
+        const struct member *member = active_member(inv, policy.outbound);
+        if (!member) {
+            *status = (struct status){0};
+            continue;
+        }
+        char id[64];
+        snprintf(id, sizeof(id), "%lld:%lld", (long long)member->subscription, (long long)member->node_id);
+        struct failover_sample active = {.id = id, .state = classify(&member->https, member->http_code),
+            .ms = member->https.ms, .checked = member->https.checked};
+        failover_record(&status->streak, &policy, &active, now, max_age);
+        if (last < 0 || status->tried_sample == active.checked ||
+            !failover_policy_ready(&policy, &active, &status->streak, now, max_age, last))
+            continue;
+        status->tried_sample = active.checked;
+        if (switch_candidate(m, &policy, status, member, &active, max_age)) break;
+    }
+}

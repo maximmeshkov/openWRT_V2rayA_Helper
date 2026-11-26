@@ -1,0 +1,19 @@
+{
+	"admin/services/v2raya-helper": {
+		"title": "v2rayA Helper",
+		"order": 80,
+		"action": { "type": "firstchild" }
+	},
+	"admin/services/v2raya-helper/routinga": {
+		"title": "RoutingA",
+		"order": 10,
+		"action": { "type": "view", "path": "v2raya-helper/routinga" },
+		"depends": { "acl": [ "v2raya-helper-routing" ] }
+	},
+	"admin/services/v2raya-helper/failover": {
+		"title": "Server switching",
+		"order": 20,
+		"action": { "type": "view", "path": "v2raya-helper/failover" },
+		"depends": { "acl": [ "v2raya-helper-failover" ] }
+	}
+}

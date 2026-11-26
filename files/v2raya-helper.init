@@ -46,7 +46,8 @@ start_service() {
 	[ -z "$xray_config" ] || procd_append_param command --xray-config "$xray_config"
 	if [ -n "$xray_config" ] && [ -n "$node_url" ]; then
 		procd_append_param command --node-url "$node_url" --node-code "$node_code" \
-			--node-interval "$node_interval" --node-timeout "$node_timeout"
+			--node-interval "$node_interval" --node-timeout "$node_timeout" \
+			--failover-file /etc/config/v2raya-helper-failover.json
 	fi
 	[ -z "$observatory" ] || procd_append_param command --observatory "$observatory"
 	[ -z "$observatory_max_age" ] || procd_append_param command --observatory-max-age "$observatory_max_age"

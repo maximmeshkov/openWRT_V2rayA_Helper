@@ -6,5 +6,31 @@
 				"v2raya-helper": [ "status" ]
 			}
 		}
+	},
+	"v2raya-helper-routing": {
+		"description": "Read and edit v2rayA RoutingA rules",
+		"read": {
+			"ubus": {
+				"v2raya-helper": [ "routing_context", "routing_preview" ]
+			}
+		},
+		"write": {
+			"ubus": {
+				"v2raya-helper": [ "routing_save" ]
+			}
+		}
+	},
+	"v2raya-helper-failover": {
+		"description": "Read and configure v2rayA automatic server switching",
+		"read": {
+			"ubus": {
+				"v2raya-helper": [ "failover_context" ]
+			}
+		},
+		"write": {
+			"ubus": {
+				"v2raya-helper": [ "failover_save" ]
+			}
+		}
 	}
 }

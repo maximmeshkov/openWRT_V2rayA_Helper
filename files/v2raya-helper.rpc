@@ -1,11 +1,53 @@
 #!/bin/sh
 
+run_helper() {
+	local api address token_file state_file local_api parent pid core assets
+	api="$(uci -q get v2raya_helper.main.api)"
+	if [ -z "$api" ]; then
+		local_api=1
+		address="$(uci -q get v2raya.config.address)"
+		address="${address:-0.0.0.0:2017}"
+		case "$address" in
+			0.0.0.0:*|:*|localhost:*) address="127.0.0.1:${address##*:}" ;;
+			'[::]:'*) address="[::1]:${address##*:}" ;;
+		esac
+		api="http://$address"
+	fi
+	token_file="$(uci -q get v2raya_helper.main.token_file)"
+	case "$1" in
+		routing) state_file=/var/run/v2raya-helper/routing.lock ;;
+		failover) state_file=/etc/config/v2raya-helper-failover.json ;;
+	esac
+	umask 077
+	if [ "$1" = routing ] && [ "$local_api" = 1 ]; then
+		parent="$(pidof v2raya)"
+		for pid in $(pidof xray); do
+			[ "$(awk '{print $4}' "/proc/$pid/stat" 2>/dev/null)" = "$parent" ] || continue
+			core="$(readlink "/proc/$pid/exe")"
+			assets="$(tr '\000' '\n' < "/proc/$pid/environ" |
+				awk '/^XRAY_LOCATION_ASSET=\// { sub(/^XRAY_LOCATION_ASSET=/, ""); print; exit }')"
+			if [ -x "$core" ] && [ -d "$assets" ]; then
+				exec /usr/bin/v2raya-helper "$1" "$2" "$api" "$token_file" "$state_file" "$core" "$assets"
+			fi
+		done
+	fi
+	exec /usr/bin/v2raya-helper "$1" "$2" "$api" "$token_file" "$state_file"
+}
+
 case "$1" in
 	list)
-		printf '%s\n' '{"status":{}}'
+		printf '%s\n' '{"status":{},"routing_context":{},"routing_preview":{"kind":"","value":"","outbound":"","before_line":0,"revision":""},"routing_save":{"kind":"","value":"","outbound":"","before_line":0,"revision":""},"failover_context":{},"failover_save":{"policy":{}}}'
 		;;
 	call)
-		[ "$2" = status ] || exit 3
+		case "$2" in
+			routing_context) run_helper routing context ;;
+			routing_preview) run_helper routing preview ;;
+			routing_save) run_helper routing save ;;
+			failover_context) run_helper failover context ;;
+			failover_save) run_helper failover save ;;
+			status) ;;
+			*) exit 3 ;;
+		esac
 		printf '{"router_unix":%s,"snapshot":' "$(date +%s)"
 		if [ -r /var/run/v2raya-helper/status.json ]; then
 			cat /var/run/v2raya-helper/status.json || exit 1

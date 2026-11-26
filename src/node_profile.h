@@ -25,5 +25,7 @@ const char *node_profile_parse(json_object *config, const struct outbound *out,
 json_object *node_config_outbound(json_object *config, const struct outbound *out,
                                   const struct member *member);
 int node_config_endpoint_matches(const char *api_address, json_object *server);
+struct measurement probe_https_profile(struct node_profile *profile, const struct https_options *options,
+                                       uint32_t mark, long *http_code);
 
 #endif

@@ -2,7 +2,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=v2raya-helper
 PKG_VERSION:=0.1.0
-PKG_RELEASE:=8
+PKG_RELEASE:=9
 
 include $(INCLUDE_DIR)/package.mk
 
@@ -50,14 +50,18 @@ endef
 
 define Package/v2raya-helper/postinst
 #!/bin/sh
-if [ -z "$${IPKG_INSTROOT}" ] && ! ubus list v2raya-helper 2>/dev/null | grep -qx v2raya-helper; then
+if [ -z "$${IPKG_INSTROOT}" ] && ! ubus -v list v2raya-helper 2>/dev/null | grep -q '"failover_context"'; then
 	/etc/init.d/rpcd reload
 fi
 endef
 
 define Package/luci-app-v2raya-helper/install
 	$(INSTALL_DIR) $(1)/www/luci-static/resources/view/status/include
+	$(INSTALL_DIR) $(1)/www/luci-static/resources/view/v2raya-helper $(1)/usr/share/luci/menu.d
 	$(INSTALL_DATA) ./files/29_v2raya_helper.js $(1)/www/luci-static/resources/view/status/include/
+	$(INSTALL_DATA) ./files/routinga.js $(1)/www/luci-static/resources/view/v2raya-helper/
+	$(INSTALL_DATA) ./files/failover.js $(1)/www/luci-static/resources/view/v2raya-helper/
+	$(INSTALL_DATA) ./files/v2raya-helper.menu.json $(1)/usr/share/luci/menu.d/v2raya-helper.json
 endef
 
 $(eval $(call BuildPackage,v2raya-helper))

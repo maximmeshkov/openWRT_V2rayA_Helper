@@ -1,6 +1,8 @@
 #define _POSIX_C_SOURCE 200809L
 #include "helper.h"
 #include "node_profile.h"
+#include "routing_editor.h"
+#include "failover_monitor.h"
 #include <curl/curl.h>
 #include <errno.h>
 #include <getopt.h>
@@ -159,10 +161,12 @@ static void replace_inventory(struct inventory *old, struct inventory *next, int
     *next = (struct inventory){0};
 }
 
-static void sync_profiles(struct inventory *inv, const char *path, json_object **config)
+static void sync_profiles(struct inventory *inv, const char *path, json_object **config,
+                          struct failover_monitor *failover)
 {
     json_object *next = node_config_read(path);
     if (!next || !*config || !json_object_equal(*config, next)) {
+        failover_monitor_reset(failover);
         for (size_t i = 0; i < inv->count; i++)
             for (size_t j = 0; j < inv->outbounds[i].count; j++) {
                 struct member *m = &inv->outbounds[i].members[j];
@@ -224,8 +228,14 @@ static long number(const char *s, unsigned long min, unsigned long max)
 
 int main(int argc, char **argv)
 {
+    if (argc > 1 && !strcmp(argv[1], "routing"))
+        return routing_editor_command(argc - 2, argv + 2);
+    if (argc > 1 && !strcmp(argv[1], "failover"))
+        return failover_command(argc - 2, argv + 2);
+
     const char *api = "http://127.0.0.1:2017", *token = NULL, *metrics = NULL;
     const char *output = "/var/run/v2raya-helper/status.json", *xray_config = NULL;
+    const char *failover_file = NULL;
     struct https_options https = {.interval = 60, .timeout = 8, .code = 204};
     json_object *profiles = NULL;
     long interval = 10, timeout = 3, workers = 2, route_ttl = 60;
@@ -236,6 +246,7 @@ int main(int argc, char **argv)
         {"workers",1,0,'w'}, {"mark",1,0,'m'}, {"observatory-max-age",1,0,'e'},
         {"xray-config",1,0,'x'},
         {"node-url",1,0,'N'}, {"node-code",1,0,'C'}, {"node-interval",1,0,'A'}, {"node-timeout",1,0,'T'},
+        {"failover-file",1,0,'F'},
         {"help",0,0,'h'}, {0,0,0,0}
     };
     int opt;
@@ -255,11 +266,13 @@ int main(int argc, char **argv)
         case 'C': https.code = number(optarg, 200, 599); break;
         case 'A': https.interval = number(optarg, 1, 86400); break;
         case 'T': https.timeout = number(optarg, 1, 60); break;
+        case 'F': failover_file = optarg; break;
         case 'h':
             puts("v2raya-helper [--api URL] [--token-file PATH] [--output PATH]\n"
                  "  [--interval SECONDS] [--timeout SECONDS] [--workers 1..16] [--mark N]\n"
                  "  [--observatory LOOPBACK_URL] [--observatory-max-age SECONDS] [--xray-config PATH]\n"
-                 "  [--node-url HTTPS_URL --node-code STATUS --node-interval SECONDS --node-timeout SECONDS]");
+                 "  [--node-url HTTPS_URL --node-code STATUS --node-interval SECONDS --node-timeout SECONDS]\n"
+                 "  [--failover-file PATH]");
             return 0;
         default: return 2;
         }
@@ -277,6 +290,8 @@ int main(int argc, char **argv)
     signal(SIGINT, stop);
     signal(SIGTERM, stop);
     signal(SIGPIPE, SIG_IGN);
+    const struct v2raya_api v2raya = {.base = api, .token_file = token, .timeout_ms = timeout * 1000};
+    struct failover_monitor *failover = failover_monitor_create(failover_file, &v2raya, &https, mark);
 
     struct inventory current = {0};
     long ttl = 2 * interval + 6 * timeout + 2;
@@ -291,7 +306,7 @@ int main(int argc, char **argv)
         if (load_inventory(api, token, xray_config, timeout * 1000, &next, err, sizeof(err)) != 0)
             goto unavailable;
         replace_inventory(&current, &next, trusted);
-        if (https.url) sync_profiles(&current, xray_config, &profiles);
+        if (https.url) sync_profiles(&current, xray_config, &profiles, failover);
         trusted = 1;
         if (publish(output, &current, current.running ? "ok" : "stopped", NULL, ttl, route_ttl, &https)) {
             rc = 1;
@@ -309,20 +324,23 @@ int main(int argc, char **argv)
             if (load_inventory(api, token, xray_config, timeout * 1000, &next, err, sizeof(err)) != 0)
                 goto unavailable;
             replace_inventory(&current, &next, 1);
-            if (https.url) sync_profiles(&current, xray_config, &profiles);
+            if (https.url) sync_profiles(&current, xray_config, &profiles, failover);
             if (publish(output, &current, current.running ? "ok" : "stopped", NULL, ttl, route_ttl, &https))
                 rc = 1;
             if (backlog) wait = 1;
         }
+        if (!stopping && !rc) failover_monitor_tick(failover, &current);
         goto sleep_cycle;
 unavailable:
         trusted = 0;
+        failover_monitor_reset(failover);
         if (publish(output, &current, "stale", err, ttl, route_ttl, &https)) rc = 1;
 sleep_cycle:
         free_inventory(&next);
         if (!rc && !stopping) sleep((unsigned)wait);
     }
     free_inventory(&current);
+    failover_monitor_free(failover);
     json_object_put(profiles);
     curl_global_cleanup();
     return rc;

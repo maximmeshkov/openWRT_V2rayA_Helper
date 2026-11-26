@@ -64,5 +64,7 @@ struct measurement probe_quic(const char *address, long timeout_ms, uint32_t mar
 void read_observatory(const char *url, struct inventory *inv, long timeout_ms, long max_age);
 int valid_observatory_url(const char *url);
 int https_target(const char *url, char *host, size_t size, int *port);
+json_object *read_rpc_json(void);
+const char *rpc_string(json_object *request, const char *key);
 
 #endif

@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 #include "helper.h"
 #include "node_profile.h"
+#include "v2raya_api.h"
 
 #include <arpa/inet.h>
 #include <ctype.h>
@@ -160,7 +161,14 @@ static const char *field_text(json_object *obj, const char *key)
 	return json_text(o);
 }
 
-json_object *fetch_json(const char *url, const char *token, long timeout_ms, char *error, size_t error_len)
+struct api_request {
+	const char *method, *json, *query;
+	int (*permitted)(void *);
+	void *context;
+};
+
+static json_object *fetch_json_request(const char *url, const char *token, const struct api_request *request,
+                                      long timeout_ms, char *error, size_t error_len)
 {
 	char bind_host[BIND_HOST_LEN] = "";
 	if (!valid_url(url, 0, bind_host) || timeout_ms <= 0) {
@@ -187,20 +195,47 @@ json_object *fetch_json(const char *url, const char *token, long timeout_ms, cha
 			return NULL;
 		}
 	}
+	const char *body_json = request ? request->json : NULL;
+	if (body_json) {
+		struct curl_slist *updated = curl_slist_append(headers, "Content-Type: application/json");
+		if (!updated) {
+			curl_slist_free_all(headers);
+			snprintf(error, error_len, "out of memory");
+			return NULL;
+		}
+		headers = updated;
+	}
 	CURL *curl = curl_easy_init();
+	CURLU *query_url = NULL;
 	struct response_body body = {0};
 	json_object *root = NULL;
 	/* Control-plane reads run on the main thread, outside the probe batch.
 	 * For remote HTTPS on a synchronous libcurl, allow its DNS timeout. */
 	long no_signal = *bind_host || valid_observatory_url(url) ||
 		(curl_version_info(CURLVERSION_NOW)->features & CURL_VERSION_ASYNCHDNS);
+	if (request && request->query) {
+		query_url = curl_url();
+		if (!query_url || curl_url_set(query_url, CURLUPART_URL, url, CURLU_DISALLOW_USER) ||
+		    curl_url_set(query_url, CURLUPART_QUERY, request->query, 0)) {
+			snprintf(error, error_len, "cannot initialize HTTP query");
+			goto done;
+		}
+	}
 	if (!curl || curl_easy_setopt(curl, CURLOPT_URL, url) ||
+	    (query_url && curl_easy_setopt(curl, CURLOPT_CURLU, query_url)) ||
 	    (*bind_host && curl_easy_setopt(curl, CURLOPT_INTERFACE, bind_host)) ||
 	    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers) ||
 	    curl_easy_setopt(curl, CURLOPT_PROXY, "") || curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 0L) ||
 	    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, no_signal) || curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, timeout_ms) ||
+	    (body_json && (curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, request->method) ||
+	                   curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body_json) ||
+	                   curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE_LARGE, (curl_off_t)strlen(body_json)))) ||
 	    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, receive_body) || curl_easy_setopt(curl, CURLOPT_WRITEDATA, &body)) {
 		snprintf(error, error_len, "cannot initialize HTTP client");
+		goto done;
+	}
+	if (request && request->permitted && !request->permitted(request->context)) {
+		snprintf(error, error_len, "failover permission expired before switching");
 		goto done;
 	}
 	CURLcode rc = curl_easy_perform(curl);
@@ -224,13 +259,19 @@ json_object *fetch_json(const char *url, const char *token, long timeout_ms, cha
 		snprintf(error, error_len, "invalid JSON response");
 done:
 	curl_easy_cleanup(curl);
+	curl_url_cleanup(query_url);
 	curl_slist_free_all(headers);
 	free(body.bytes);
 	return root;
 }
 
-static json_object *get_data(const char *base, const char *endpoint, const char *token,
-                             long timeout_ms, char *error, size_t error_len)
+json_object *fetch_json(const char *url, const char *token, long timeout_ms, char *error, size_t error_len)
+{
+	return fetch_json_request(url, token, NULL, timeout_ms, error, error_len);
+}
+
+static json_object *request_api(const char *base, const char *endpoint, const char *token,
+                               const struct api_request *request, long timeout_ms, char *error, size_t error_len)
 {
 	size_t n = strlen(base);
 	while (n && base[n-1] == '/')
@@ -243,11 +284,10 @@ static json_object *get_data(const char *base, const char *endpoint, const char 
 	}
 	memcpy(url, base, n);
 	snprintf(url + n, cap - n, "/api/%s", endpoint);
-	json_object *envelope = fetch_json(url, token, timeout_ms, error, error_len);
+	json_object *envelope = fetch_json_request(url, token, request, timeout_ms, error, error_len);
 	free(url);
 	if (!envelope)
 		return NULL;
-	json_object *result = NULL;
 	const char *code = field_text(envelope, "code");
 	const char *message = field_text(envelope, "message");
 	if (!code || strcmp(code, "SUCCESS") != 0) {
@@ -258,16 +298,173 @@ static json_object *get_data(const char *base, const char *endpoint, const char 
 			snprintf(error, error_len, "v2rayA authorization required");
 		else
 			snprintf(error, error_len, "v2rayA %s response unavailable or busy", endpoint);
-		goto done;
+		json_object_put(envelope);
+		return NULL;
 	}
+	return envelope;
+}
+
+static json_object *request_data(const char *base, const char *endpoint, const char *token,
+                                const struct api_request *request, long timeout_ms,
+                                char *error, size_t error_len)
+{
+	json_object *envelope = request_api(base, endpoint, token, request, timeout_ms, error, error_len);
+	if (!envelope)
+		return NULL;
+	json_object *result = NULL;
 	json_object *data = NULL;
 	if (json_object_object_get_ex(envelope, "data", &data) && json_object_is_type(data, json_type_object))
 		result = json_object_get(data);
 	else
 		snprintf(error, error_len, "invalid v2rayA %s response", endpoint);
-done:
 	json_object_put(envelope);
 	return result;
+}
+
+static json_object *get_data(const char *base, const char *endpoint, const char *token,
+                             long timeout_ms, char *error, size_t error_len)
+{
+	return request_data(base, endpoint, token, NULL, timeout_ms, error, error_len);
+}
+
+static json_object *client_data(const struct v2raya_api *api, const char *endpoint, int needs_token,
+                               const struct api_request *request, char *error, size_t len)
+{
+	if (!api || !valid_url(api->base, 0, NULL) || api->timeout_ms <= 0) {
+		snprintf(error, len, "invalid v2rayA URL or timeout; use HTTPS or this router's numeric HTTP IP");
+		return NULL;
+	}
+	char token[TOKEN_LIMIT + 2] = "";
+	if (needs_token && read_token(api->token_file, token)) {
+		snprintf(error, len, "cannot read v2rayA authorization token");
+		return NULL;
+	}
+	return request_data(api->base, endpoint, token, request, api->timeout_ms, error, len);
+}
+
+static char *copy_api_field(json_object *data, const char *endpoint, const char *key, char *error, size_t len)
+{
+	if (!data)
+		return NULL;
+	const char *value = field_text(data, key);
+	char *copy = value ? strdup(value) : NULL;
+	if (!copy) {
+		if (value) snprintf(error, len, "out of memory");
+		else snprintf(error, len, "invalid v2rayA %s response", endpoint);
+	}
+	json_object_put(data);
+	return copy;
+}
+
+char *v2raya_api_get_version(const struct v2raya_api *api, char *error, size_t len)
+{
+	return copy_api_field(v2raya_api_version_data(api, error, len), "version", "version", error, len);
+}
+
+char *v2raya_api_get_routing(const struct v2raya_api *api, char *error, size_t len)
+{
+	return copy_api_field(client_data(api, "routingA", 1, NULL, error, len), "routingA", "routingA", error, len);
+}
+
+json_object *v2raya_api_version_data(const struct v2raya_api *api, char *error, size_t len)
+{
+	return client_data(api, "version", 0, NULL, error, len);
+}
+
+json_object *v2raya_api_touch_data(const struct v2raya_api *api, char *error, size_t len)
+{
+	return client_data(api, "touch", 1, NULL, error, len);
+}
+
+char *v2raya_api_export_node(const struct v2raya_api *api, json_object *which, char *error, size_t len)
+{
+	const char *json = json_object_to_json_string_ext(which, JSON_C_TO_STRING_PLAIN);
+	char *encoded = json ? curl_easy_escape(NULL, json, 0) : NULL;
+	if (!encoded) {
+		snprintf(error, len, "cannot encode the server reference");
+		return NULL;
+	}
+	size_t query_len = sizeof("touch=") + strlen(encoded);
+	char *query = malloc(query_len);
+	if (!query) {
+		curl_free(encoded);
+		snprintf(error, len, "out of memory");
+		return NULL;
+	}
+	snprintf(query, query_len, "touch=%s", encoded);
+	curl_free(encoded);
+	struct api_request request = {.query = query};
+	json_object *data = client_data(api, "sharingAddress", 1, &request, error, len);
+	free(query);
+	return copy_api_field(data, "sharingAddress", "sharingAddress", error, len);
+}
+
+json_object *v2raya_api_connect_node(const struct v2raya_api *api, json_object *which,
+                                   int (*permitted)(void *), void *context, char *error, size_t len)
+{
+	const char *json = json_object_to_json_string_ext(which, JSON_C_TO_STRING_PLAIN);
+	if (!json) {
+		snprintf(error, len, "cannot encode the server reference");
+		return NULL;
+	}
+	struct api_request request = {.method = "POST", .json = json, .permitted = permitted, .context = context};
+	return client_data(api, "connection", 1, &request, error, len);
+}
+
+int v2raya_api_save_routing(const struct v2raya_api *api, const char *expected_original,
+                          const char *routing, char *error, size_t len)
+{
+	if (!expected_original || !routing || strlen(routing) >= RESPONSE_LIMIT) {
+		snprintf(error, len, "invalid or oversized RoutingA document");
+		return -1;
+	}
+	char *version = v2raya_api_get_version(api, error, len);
+	if (!version)
+		return -1;
+	int can_save = !strcmp(version, "2.2.7.4");
+	free(version);
+	if (!can_save) {
+		snprintf(error, len, "saving RoutingA without a core restart is unverified for this v2rayA version");
+		return -1;
+	}
+	char token[TOKEN_LIMIT + 2];
+	if (read_token(api->token_file, token)) {
+		snprintf(error, len, "cannot read v2rayA authorization token");
+		return -1;
+	}
+	json_object *body = json_object_new_object();
+	json_object *text = json_object_new_string(routing);
+	if (!body || !text || json_object_object_add(body, "routingA", text)) {
+		json_object_put(text);
+		json_object_put(body);
+		snprintf(error, len, "out of memory");
+		return -1;
+	}
+	const char *payload = json_object_to_json_string_ext(body, JSON_C_TO_STRING_PLAIN);
+	int saved = 0;
+	if (!payload || strlen(payload) > RESPONSE_LIMIT) {
+		snprintf(error, len, "oversized or unavailable RoutingA payload");
+		goto done;
+	}
+	json_object *data = get_data(api->base, "routingA", token, api->timeout_ms, error, len);
+	if (!data)
+		goto done;
+	const char *latest = field_text(data, "routingA");
+	int matches = latest && !strcmp(latest, expected_original);
+	json_object_put(data);
+	if (!matches) {
+		snprintf(error, len, "RoutingA changed; refresh the preview");
+		goto done;
+	}
+	struct api_request request = {.method = "PUT", .json = payload};
+	json_object *reply = request_api(api->base, "routingA", token, &request, api->timeout_ms, error, len);
+	if (reply) {
+		json_object_put(reply);
+		saved = 1;
+	}
+done:
+	json_object_put(body);
+	return saved ? 0 : -1;
 }
 
 // The API exposes display text. Bare Trojan can conceal mKCP, and XHTTP

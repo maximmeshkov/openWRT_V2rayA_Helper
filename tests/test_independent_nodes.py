@@ -7,12 +7,13 @@ from socketserver import StreamRequestHandler, ThreadingTCPServer
 import ssl
 import subprocess
 from threading import Event, Thread
+import time
 from unittest.mock import patch
 
 from test_monitor import MonitorHarness, assignment, profile, rows
 
 
-class IndependentNodes(MonitorHarness):
+class NodeFixture(MonitorHarness):
     def setUp(self):
         super().setUp()
         self.config = Path(self.tmp.name, "core.json")
@@ -28,6 +29,7 @@ class IndependentNodes(MonitorHarness):
         self.waiting = Event()
         self.release = Event()
         self.seen = []
+        self.auth_failures = []
         fixture = self
 
         class Socks(StreamRequestHandler):
@@ -44,6 +46,7 @@ class IndependentNodes(MonitorHarness):
                 user = self.rfile.read(self.rfile.read(1)[0])
                 password = self.rfile.read(self.rfile.read(1)[0])
                 if (user, password) != (b"fixture", b"correct"):
+                    fixture.auth_failures.append(time.monotonic())
                     self.wfile.write(b"\x01\x01")
                     return
                 self.wfile.write(b"\x01\x00")
@@ -110,6 +113,8 @@ class IndependentNodes(MonitorHarness):
         self.assertEqual(stream.read(10), b"\x05\x00\x00\x01" + bytes(6))
         return stream
 
+
+class IndependentNodes(NodeFixture):
     def test_unused_members_credential_change_removal_and_inflight_result(self):
         keep, drop, new = "Произвольный тег", "Unused Side", "Добавлен при работе"
         self.configure([(keep, 1, "correct"), (drop, 2, "wrong")])

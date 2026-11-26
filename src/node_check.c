@@ -104,31 +104,23 @@ static int via_xhttp(struct node_profile *p, const struct https_options *opt, ui
     return ok;
 }
 
-void probe_node(struct probe_job job, json_object *config, const struct https_options *opt,
-                uint32_t mark)
+struct measurement probe_https_profile(struct node_profile *p, const struct https_options *opt,
+                                       uint32_t mark, long *http_code)
 {
-    struct node_profile p;
     struct measurement m = {.state = "unsupported", .checked = time(NULL)};
-    const char *reason = config ? node_profile_parse(config, job.out, job.member, &p) : "config_unavailable";
-    if (reason) {
-        m.detail = reason;
-        job.member->https = m;
-        return;
-    }
-    uint32_t socket_mark = p.has_mark ? p.mark : mark;
+    *http_code = 0;
+    uint32_t socket_mark = p->has_mark ? p->mark : mark;
     struct node_https_result r = {.detail = "probe_unavailable"};
     int ok;
-    if (p.kind == NODE_VLESS_XHTTP) {
-        if (p.http_version == 2 && !(curl_version_info(CURLVERSION_NOW)->features & CURL_VERSION_HTTP2)) {
+    if (p->kind == NODE_VLESS_XHTTP) {
+        if (p->http_version == 2 && !(curl_version_info(CURLVERSION_NOW)->features & CURL_VERSION_HTTP2)) {
             m.detail = "HTTP/2 unavailable in libcurl";
-            job.member->https = m;
-            return;
+            return m;
         }
-        job.member->standard_tls = *p.fingerprint != 0;
-        ok = via_xhttp(&p, opt, socket_mark, &r);
+        ok = via_xhttp(p, opt, socket_mark, &r);
     } else {
-        const char *scheme = p.kind == NODE_SOCKS5 ? "socks5h" : p.kind == NODE_HTTP ? "http" : "https";
-        struct node_https_proxy proxy = {scheme, p.host, p.username, p.password, p.port};
+        const char *scheme = p->kind == NODE_SOCKS5 ? "socks5h" : p->kind == NODE_HTTP ? "http" : "https";
+        struct node_https_proxy proxy = {scheme, p->host, p->username, p->password, p->port};
         ok = node_https_proxy(&proxy, opt->url, opt->timeout*1000, socket_mark, opt->code, &r);
     }
     m.checked = time(NULL);
@@ -136,6 +128,19 @@ void probe_node(struct probe_job job, json_object *config, const struct https_op
     m.detail = r.detail;
     if (!ok && r.detail && !strncmp(r.detail, "unsupported", 11)) m.state = "unsupported";
     m.ms = r.ms;
-    job.member->http_code = r.http_code;
-    job.member->https = m;
+    *http_code = r.http_code;
+    return m;
+}
+
+void probe_node(struct probe_job job, json_object *config, const struct https_options *opt,
+                uint32_t mark)
+{
+    struct node_profile p;
+    const char *reason = config ? node_profile_parse(config, job.out, job.member, &p) : "config_unavailable";
+    if (reason) {
+        job.member->https = (struct measurement){.state = "unsupported", .detail = reason, .checked = time(NULL)};
+        return;
+    }
+    job.member->standard_tls = p.kind == NODE_VLESS_XHTTP && *p.fingerprint != 0;
+    job.member->https = probe_https_profile(&p, opt, mark, &job.member->http_code);
 }
