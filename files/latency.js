@@ -14,7 +14,7 @@ var readHistory = rpc.declare({
 
 var palette = ['#3388d7', '#238b6c', '#ac620f', '#a958a5', '#698018', '#7964cf', '#bd5670', '#008497'];
 var dashStyles = [[], [7, 3], [2, 3], [8, 2, 2, 2], [12, 4], [4, 4], [10, 2, 4, 2], [3, 2, 3, 5]];
-var colors = { timeout: '#d32f2f', error: '#d84d5b' };
+var colors = { timeout: '#f05260', error: '#d84d5b' };
 var states = ['ok', 'timeout', 'error'];
 
 function option(value, label) {
@@ -68,10 +68,14 @@ function draw(canvas, samples, now, hours, pens) {
 
 	var failures = new Map();
 	samples.forEach(function(sample) {
-		if (sample.state !== 'ok' && !failures.has(sample.outbound))
-			failures.set(sample.outbound, failures.size);
+		if (sample.state === 'ok')
+			return;
+		if (!failures.has(sample.outbound))
+			failures.set(sample.outbound, { index: failures.size, timeout: false, error: false });
+		failures.get(sample.outbound)[sample.state] = true;
 	});
-	var height = 270 + failures.size * 18;
+	var failureHeight = 30;
+	var height = 270 + failures.size * failureHeight;
 	canvas.style.height = height + 'px';
 	var box = canvas.getBoundingClientRect();
 	var width = Math.max(280, box.width || 720);
@@ -114,25 +118,32 @@ function draw(canvas, samples, now, hours, pens) {
 		line(left, y(tick), right, y(tick), gridColor, .16);
 		context.fillText(tick + ' ' + _('ms'), left - 6, y(tick));
 	}
-	var firstFailure = bottom + 17;
-	failures.forEach(function(index, name) {
-		var at = firstFailure + index * 18;
-		line(left, at, right, at, gridColor, .16);
-		context.fillStyle = pens.get(name).color;
+	var firstFailure = bottom + 22;
+	function failureY(sample) {
+		var row = failures.get(sample.outbound);
+		var center = firstFailure + row.index * failureHeight;
+		return row.timeout && row.error ? center + (sample.state === 'timeout' ? -6 : 8) : center;
+	}
+	failures.forEach(function(row, name) {
+		var at = firstFailure + row.index * failureHeight;
+		context.fillStyle = row.timeout ? colors.timeout : gridColor;
+		context.globalAlpha = .11;
+		context.fillRect(left, at - 14, right - left, 28);
+		context.globalAlpha = 1;
+		context.fillStyle = gridColor;
 		context.fillText(name, left - 6, at, left - 9);
 	});
 	context.fillStyle = gridColor;
 	context.textBaseline = 'top';
 	for (var at = begin; at <= now; at += stepX) {
-		line(x(at), top, x(at), bottom + failures.size * 18 + 4, gridColor, .13);
+		line(x(at), top, x(at), bottom + failures.size * failureHeight + 6, gridColor, .13);
 		context.textAlign = at === begin ? 'left' : (at === now ? 'right' : 'center');
 		context.fillText(timeLabel(at, hours), x(at), height - 21);
 	}
 
 	var previous = new Map();
 	samples.forEach(function(sample) {
-		var point = { sample: sample, x: x(sample.at), y: sample.state === 'ok' ? y(sample.ms) :
-			firstFailure + failures.get(sample.outbound) * 18 };
+		var point = { sample: sample, x: x(sample.at), y: sample.state === 'ok' ? y(sample.ms) : failureY(sample) };
 		plotted.push(point);
 		if (sample.role !== 'active')
 			return;
@@ -161,10 +172,10 @@ function draw(canvas, samples, now, hours, pens) {
 		context.strokeStyle = context.fillStyle;
 		context.beginPath();
 		if (state === 'timeout') {
-			context.moveTo(point.x, point.y - 5);
-			context.lineTo(point.x + 5, point.y);
-			context.lineTo(point.x, point.y + 5);
-			context.lineTo(point.x - 5, point.y);
+			context.moveTo(point.x, point.y - 8);
+			context.lineTo(point.x + 8, point.y);
+			context.lineTo(point.x, point.y + 8);
+			context.lineTo(point.x - 8, point.y);
 			context.closePath();
 			context.fill();
 		} else if (state === 'error') {
@@ -214,13 +225,14 @@ return view.extend({
 		});
 		var status = E('p', { 'role': 'status' });
 		var detail = E('p', { 'style': 'min-height:1.5em;overflow-wrap:anywhere', 'aria-live': 'polite' });
+		var timeoutCount = E('strong');
 		var heading = E('div', { 'style': 'display:flex;gap:1em;flex-wrap:wrap;align-items:center' }, [
 			E('label', { 'for': range.id }, [_('Time range')]), range
 		]);
 		var graph = E('figure', { 'style': 'margin:1em 0 0' }, [canvas, E('figcaption', {}, [
 			legendItem('━', 'currentColor', _('Assigned server')),
 			legendItem('○', 'currentColor', _('Reserve check')),
-			legendItem('◆', colors.timeout, _('Timeout')),
+			legendItem('◆', colors.timeout, timeoutCount),
 			legendItem('×', colors.error, _('Error'))
 		]), detail]);
 		var root = E('div', {}, [E('h2', {}, [_('HTTPS latency')]), heading, outboundsField, status, graph]);
@@ -279,6 +291,9 @@ return view.extend({
 			var visible = history.filter(function(sample) {
 				return boxes.has(sample.outbound) && !hidden.has(sample.outbound) && sample.at >= from && sample.at <= now;
 			});
+			timeoutCount.textContent = _('Timeout (%d)').format(visible.filter(function(sample) {
+				return sample.state === 'timeout';
+			}).length);
 			graph.hidden = !visible.length;
 			points = visible.length ? draw(canvas, visible, now, hours, pens) : [];
 			review(-1);

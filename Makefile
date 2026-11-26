@@ -2,10 +2,12 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=v2raya-helper
 PKG_VERSION:=0.1.0
-PKG_RELEASE:=20
+PKG_RELEASE:=21
 
-# LuCI's asset version follows luci-base. Give this view a package-specific URL.
-FAILOVER_VIEW:=failover-$(subst .,-,$(PKG_VERSION))-$(PKG_RELEASE)
+# LuCI's asset version follows luci-base. Give these views package-specific URLs.
+VIEW_VERSION:=$(subst .,-,$(PKG_VERSION))-$(PKG_RELEASE)
+FAILOVER_VIEW:=failover-$(VIEW_VERSION)
+LATENCY_VIEW:=latency-$(VIEW_VERSION)
 
 include $(INCLUDE_DIR)/package.mk
 
@@ -64,9 +66,10 @@ define Package/luci-app-v2raya-helper/install
 	$(INSTALL_DATA) ./files/29_v2raya_helper.js $(1)/www/luci-static/resources/view/status/include/
 	$(INSTALL_DATA) ./files/routinga.js $(1)/www/luci-static/resources/view/v2raya-helper/
 	$(INSTALL_DATA) ./files/failover.js $(1)/www/luci-static/resources/view/v2raya-helper/$(FAILOVER_VIEW).js
-	$(INSTALL_DATA) ./files/latency.js $(1)/www/luci-static/resources/view/v2raya-helper/
+	$(INSTALL_DATA) ./files/latency.js $(1)/www/luci-static/resources/view/v2raya-helper/$(LATENCY_VIEW).js
 	$(INSTALL_DATA) ./files/v2raya-helper.menu.json $(1)/usr/share/luci/menu.d/v2raya-helper.json
 	$(SED) 's|"path": "v2raya-helper/failover"|"path": "v2raya-helper/$(FAILOVER_VIEW)"|' $(1)/usr/share/luci/menu.d/v2raya-helper.json
+	$(SED) 's|"path": "v2raya-helper/latency"|"path": "v2raya-helper/$(LATENCY_VIEW)"|' $(1)/usr/share/luci/menu.d/v2raya-helper.json
 endef
 
 define Package/luci-app-v2raya-helper/postinst
