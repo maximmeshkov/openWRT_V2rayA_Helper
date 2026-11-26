@@ -17,6 +17,7 @@ struct member {
     char *name, *address;
     const char *transport;
     char *display_net;
+    char key[33];
     int64_t node_id, subscription;
     int selected;
     struct measurement server;

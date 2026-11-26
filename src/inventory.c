@@ -1,5 +1,6 @@
 #define _POSIX_C_SOURCE 200809L
 #include "helper.h"
+#include "node_key.h"
 #include "node_profile.h"
 #include "v2raya_api.h"
 
@@ -8,6 +9,7 @@
 #include <curl/curl.h>
 #include <fcntl.h>
 #include <ifaddrs.h>
+#include <inttypes.h>
 #include <net/if.h>
 #include <netdb.h>
 #include <stdint.h>
@@ -525,7 +527,7 @@ static int64_t field_int(json_object *obj, const char *key)
 	return json_object_is_type(v, json_type_int) ? json_object_get_int64(v) : -1;
 }
 
-static int add_member(struct outbound *out, json_object *server, json_object *ref)
+static int add_member(struct outbound *out, json_object *server, json_object *ref, const char *source)
 {
 	const char *name = field_text(server, "name");
 	const char *address = field_text(server, "address");
@@ -545,6 +547,12 @@ static int add_member(struct outbound *out, json_object *server, json_object *re
 		.subscription = !strcmp(field_text(ref, "_type"), "server") ? -1 : field_int(ref, "sub"),
 		.selected = json_object_is_type(selected, json_type_boolean) && json_object_get_boolean(selected)
 	};
+	char fallback[32];
+	if (!source || !*source) {
+		snprintf(fallback, sizeof(fallback), "index:%" PRId64, m->subscription);
+		source = m->subscription < 0 ? "" : fallback;
+	}
+	node_key(m->key, field_text(ref, "_type"), source, name, address, net);
 	return m->name && m->address && m->transport && m->display_net ? 0 : -1;
 }
 
@@ -588,6 +596,7 @@ static int parse_inventory(json_object *names_data, json_object *touch_data, str
 		int64_t id = field_int(ref, "id");
 		struct outbound *out = find_outbound(inv, outbound && *outbound ? outbound : "proxy");
 		json_object *list = servers;
+		const char *source = "";
 		if (!type || !out || id < 1)
 			return -1;
 		if (!strcmp(type, "subscriptionServer")) {
@@ -596,6 +605,7 @@ static int parse_inventory(json_object *names_data, json_object *touch_data, str
 			if (sub < 0 || (uint64_t)sub >= json_object_array_length(subs))
 				return -1;
 			json_object *subscription = json_object_array_get_idx(subs, (size_t)sub);
+			source = field_text(subscription, "address");
 			if (!json_object_object_get_ex(subscription, "servers", &list) || !json_object_is_type(list, json_type_array))
 				return -1;
 		} else if (strcmp(type, "server")) {
@@ -604,7 +614,7 @@ static int parse_inventory(json_object *names_data, json_object *touch_data, str
 		if ((uint64_t)id > json_object_array_length(list))
 			return -1;
 		json_object *server = json_object_array_get_idx(list, (size_t)id - 1);
-		if (field_int(server, "id") != id || add_member(out, server, ref))
+		if (field_int(server, "id") != id || add_member(out, server, ref, source))
 			return -1;
 	}
 	return 0;

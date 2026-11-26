@@ -245,7 +245,16 @@ return view.extend({
 				return;
 			}
 			context = reply;
-			catalogue = new Map(reply.nodes.map(function(node) { return [node.key, node]; }));
+			catalogue = new Map();
+			var ambiguous = new Set();
+			reply.nodes.forEach(function(node) {
+				if (catalogue.has(node.key)) {
+					catalogue.delete(node.key);
+					ambiguous.add(node.key);
+				} else if (!ambiguous.has(node.key)) {
+					catalogue.set(node.key, node);
+				}
+			});
 			saved = new Map(reply.policies.map(function(policy) { return [policy.outbound, policy]; }));
 			drafts.forEach(function(policy, name) {
 				if (!dirty.has(name))

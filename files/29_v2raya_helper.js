@@ -1,6 +1,9 @@
 'use strict';
 'require baseclass';
 'require rpc';
+'require request';
+'require session';
+'require ui';
 
 var readStatus = rpc.declare({
 	object: 'v2raya-helper',
@@ -8,6 +11,44 @@ var readStatus = rpc.declare({
 	expect: { '': {} },
 	reject: true
 });
+
+var checkedMenu = false;
+var menuRefreshKey = 'v2raya-helper-menu-refreshed';
+
+function helperPages(tree) {
+	var admin = tree && tree.children && tree.children.admin;
+	var services = admin && admin.children && admin.children.services;
+	var helper = services && services.children && services.children['v2raya-helper'];
+	if (!helper || !helper.satisfied || !helper.children)
+		return [];
+	return ['routinga', 'failover', 'latency'].filter(function(name) {
+		return helper.children[name] && helper.children[name].satisfied;
+	});
+}
+
+/* LuCI reuses a per-session menu across package upgrades. Check the current
+ * menu once from Overview and refresh only when an accessible page is missing. */
+function refreshHelperMenu() {
+	if (checkedMenu || !ui.menu || typeof ui.menu.flushCache !== 'function')
+		return;
+	checkedMenu = true;
+	ui.menu.load().then(function(menu) {
+		var available = helperPages(menu);
+		if (available.length === 3) {
+			session.setLocalData(menuRefreshKey, null);
+			return;
+		}
+		if (session.getLocalData(menuRefreshKey))
+			return;
+		return request.get(L.url('admin/menu')).then(function(reply) {
+			if (helperPages(reply.json()).some(function(name) { return available.indexOf(name) < 0; }) &&
+			    session.setLocalData(menuRefreshKey, true)) {
+				ui.menu.flushCache();
+				window.location.reload();
+			}
+		});
+	}).catch(function() {});
+}
 
 function textCell(label, value, span) {
 	return E('td', { 'class': 'td', 'data-title': label, 'rowspan': span || 1 }, [value]);
@@ -56,7 +97,11 @@ function reading(result, route) {
 	}
 	if ((result.state === 'ok' || (http && result.state === 'error' && !activeTimeout)) && Number.isFinite(result.ms))
 		label += ' · ' + result.ms + ' ' + _('ms');
-	return E('span', { 'class': style ? 'label ' + style : '', 'title': title }, [label]);
+	var attrs = { 'class': style ? 'label ' + style : '', 'title': title };
+	// LuCI Bootstrap does not assign a color to .label.danger.
+	if (activeTimeout)
+		attrs.style = 'background: #d32f2f; color: #fff';
+	return E('span', attrs, [label]);
 }
 
 return baseclass.extend({
@@ -64,7 +109,11 @@ return baseclass.extend({
 
 	load: function() {
 		// A transient rpcd error must not make LuCI drop the include from later polls.
-		return readStatus().catch(function() { return {}; });
+		return readStatus().then(function(reply) {
+			if (reply && reply.snapshot)
+				refreshHelperMenu();
+			return reply;
+		}).catch(function() { return {}; });
 	},
 
 	render: function(reply) {

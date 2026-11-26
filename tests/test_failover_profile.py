@@ -45,7 +45,7 @@ int main(int argc, char **argv) {
 ''')
         cls.binary = root / "driver"
         subprocess.run(["cc", "-std=gnu11", "-Wall", "-Wextra", "-Werror", "-I", src, driver,
-                        src / "inventory.c", src / "node_profile.c", src / "failover_profile.c",
+                        src / "inventory.c", src / "node_profile.c", src / "node_key.c", src / "failover_profile.c",
                         "-lcurl", "-ljson-c", "-o", cls.binary], check=True)
 
     def check(self, uri):

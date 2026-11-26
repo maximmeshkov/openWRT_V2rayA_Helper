@@ -118,8 +118,7 @@ static int same_assignment(const struct outbound *a, const struct outbound *b)
     if (a->count != b->count || strcmp(a->name, b->name)) return 0;
     for (size_t j = 0; j < a->count; ++j) {
         const struct member *x = &a->members[j], *y = &b->members[j];
-        if (strcmp(x->name, y->name) || strcmp(x->address, y->address) ||
-            strcmp(x->display_net, y->display_net) || strcmp(x->transport, y->transport) || x->node_id != y->node_id ||
+        if (strcmp(x->key, y->key) || strcmp(x->transport, y->transport) || x->node_id != y->node_id ||
             x->subscription != y->subscription || x->selected != y->selected)
             return 0;
     }
@@ -190,9 +189,8 @@ static void record_latency(struct latency_history *history, const struct invento
         const struct outbound *out = &inv->outbounds[i];
         for (size_t j = 0; j < out->count; j++) {
             const struct member *m = &out->members[j];
-            char series[80];
-            snprintf(series, sizeof(series), "%016" PRIx64 ":%" PRId64 ":%" PRId64,
-                     generation, m->subscription, m->node_id);
+            char series[50];
+            snprintf(series, sizeof(series), "%016" PRIx64 ":%s", generation, m->key);
             latency_history_add(history, out->name, m->name, series, &m->https, "active");
         }
     }
@@ -364,7 +362,7 @@ int main(int argc, char **argv)
                 rc = 1;
             if (backlog) wait = 1;
         }
-        if (!stopping && !rc) failover_monitor_tick(failover, &current);
+        if (!stopping && !rc) failover_monitor_tick(failover, &current, xray_config, profiles);
         goto sleep_cycle;
 unavailable:
         if (trusted) ++generation;

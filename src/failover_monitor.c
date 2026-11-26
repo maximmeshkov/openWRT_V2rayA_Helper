@@ -204,6 +204,8 @@ struct switch_gate {
     const struct failover_policy *policy;
     struct status *status;
     const struct failover_sample *active, *candidate;
+    const char *config_path;
+    json_object *config;
     long max_age;
     int attempted;
 };
@@ -214,15 +216,20 @@ static int permit_switch(void *opaque)
     time_t now = time(NULL), last = last_attempt(gate->monitor->last_path, now);
     if (last < 0 ||
         !failover_policy_choose(gate->policy, gate->active, &gate->status->streak,
-                                gate->candidate, 1, now, gate->max_age, last) ||
-        record_attempt(gate->monitor->last_path, now, gate->policy->cooldown_seconds))
+                                gate->candidate, 1, now, gate->max_age, last))
+        return 0;
+    json_object *current = node_config_read(gate->config_path);
+    int unchanged = current && json_object_equal(current, gate->config);
+    json_object_put(current);
+    if (!unchanged || record_attempt(gate->monitor->last_path, now, gate->policy->cooldown_seconds))
         return 0;
     gate->attempted = 1;
     return 1;
 }
 
 static int switch_candidate(struct failover_monitor *m, const struct failover_policy *policy,
-    struct status *status, const struct member *member, const struct failover_sample *active, long max_age)
+    struct status *status, const struct member *member, const struct failover_sample *active, long max_age,
+    const char *config_path, json_object *config)
 {
     char error[160] = {0};
     struct failover_catalogue catalog = {0};
@@ -233,8 +240,7 @@ static int switch_candidate(struct failover_monitor *m, const struct failover_po
     for (size_t i = 0; i < catalog.count; i++) {
         const struct failover_node *node = &catalog.nodes[i];
         if (node->id == member->node_id && node->sub == member->subscription &&
-            !strcmp(node->name, member->name) && !strcmp(node->address, member->address) &&
-            !strcmp(node->net, member->display_net)) current = node;
+            !strcmp(node->key, member->key)) current = node;
     }
     if (!current) goto done;
     size_t count = json_object_array_length(policy->candidates);
@@ -254,7 +260,9 @@ static int switch_candidate(struct failover_monitor *m, const struct failover_po
             time_t now = time(NULL), last = last_attempt(m->last_path, now);
             if (fresh && last >= 0 && json_object_equal(fresh, m->settings) &&
                 failover_policy_choose(policy, active, &status->streak, &result, 1, now, max_age, last)) {
-                struct switch_gate gate = {m, policy, status, active, &result, max_age, 0};
+                struct switch_gate gate = {.monitor = m, .policy = policy, .status = status,
+                    .active = active, .candidate = &result, .config_path = config_path,
+                    .config = config, .max_age = max_age};
                 int rc = failover_api_connect(&m->api, policy->outbound, current, candidate, link,
                                                permit_switch, &gate, error, sizeof(error));
                 attempted = gate.attempted;
@@ -275,10 +283,11 @@ done:
     return attempted;
 }
 
-void failover_monitor_tick(struct failover_monitor *m, const struct inventory *inv)
+void failover_monitor_tick(struct failover_monitor *m, const struct inventory *inv,
+                           const char *config_path, json_object *config)
 {
     if (!m) return;
-    if (!inv || !inv->running) {
+    if (!inv || !inv->running || !config) {
         failover_monitor_reset(m);
         return;
     }
@@ -296,15 +305,13 @@ void failover_monitor_tick(struct failover_monitor *m, const struct inventory *i
             *status = (struct status){0};
             continue;
         }
-        char id[64];
-        snprintf(id, sizeof(id), "%lld:%lld", (long long)member->subscription, (long long)member->node_id);
-        struct failover_sample active = {.id = id, .state = classify(&member->https, member->http_code),
+        struct failover_sample active = {.id = member->key, .state = classify(&member->https, member->http_code),
             .ms = member->https.ms, .checked = member->https.checked};
         failover_record(&status->streak, &policy, &active, now, max_age);
         if (last < 0 || status->tried_sample == active.checked ||
             !failover_policy_ready(&policy, &active, &status->streak, now, max_age, last))
             continue;
         status->tried_sample = active.checked;
-        if (switch_candidate(m, &policy, status, member, &active, max_age)) break;
+        if (switch_candidate(m, &policy, status, member, &active, max_age, config_path, config)) break;
     }
 }
