@@ -176,6 +176,7 @@ class MonitorTest(MonitorHarness):
                               assignment("Group", 1, 1), assignment("Ambiguous", 2)]
         self.start()
         snapshot = self.wait_for(lambda d: server_state(d, "proxy") == "ok")
+        self.assertNotIn("node_check_interval", snapshot)
         items = rows(snapshot)
         self.assertEqual(set(items), set(self.api.names))
         self.assertEqual(items["Empty"]["members"], [])

@@ -136,6 +136,7 @@ class IndependentNodes(NodeFixture):
                        "--node-timeout", "3", "--node-interval", "1", "--xray-config", str(self.config))
         first = self.wait_for(lambda s: sample(s, keep).get("state") == "ok" and
                               sample(s, drop).get("state") == "error", timeout=14)
+        self.assertEqual(first["node_check_interval"], 1)
         self.assertEqual(sample(first, keep)["http_code"], 204)
         self.assertTrue(self.seen)
         self.assertEqual(rows(first)[drop]["members"][0]["server"]["state"], "ok")

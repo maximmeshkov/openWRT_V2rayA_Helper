@@ -21,6 +21,7 @@ struct status {
     struct failover_streak streak;
     size_t next_candidate;
     time_t tried_sample;
+    int ready, awaiting_sample;
 };
 
 struct failover_monitor {
@@ -33,6 +34,9 @@ struct failover_monitor {
     json_object *settings;
     struct status *rows;
     size_t count;
+    json_object *switch_config;
+    size_t switched_row;
+    char switched_key[FAILOVER_ID_LIMIT + 1];
 };
 
 int failover_lock_settings(const char *path)
@@ -71,12 +75,16 @@ void failover_monitor_free(struct failover_monitor *m)
     free(m->last_path);
     free(m->rows);
     json_object_put(m->settings);
+    json_object_put(m->switch_config);
     free(m);
 }
 
 void failover_monitor_reset(struct failover_monitor *m)
 {
-    if (m && m->rows) memset(m->rows, 0, m->count * sizeof(*m->rows));
+    if (!m) return;
+    if (m->rows) memset(m->rows, 0, m->count * sizeof(*m->rows));
+    json_object_put(m->switch_config);
+    m->switch_config = NULL;
 }
 
 static json_object *reload_policies(struct failover_monitor *m)
@@ -139,12 +147,58 @@ static int record_attempt(const char *path, time_t when, unsigned cooldown)
     return rc;
 }
 
-static const struct member *active_member(const struct inventory *inv, const char *name)
+static const struct outbound *single_outbound(const struct inventory *inv, const char *name)
 {
     for (size_t i = 0; i < inv->count; i++)
         if (inv->outbounds[i].count == 1 && !strcmp(inv->outbounds[i].name, name))
-            return &inv->outbounds[i].members[0];
+            return &inv->outbounds[i];
     return NULL;
+}
+
+void failover_monitor_config_changed(struct failover_monitor *m, const struct inventory *inv,
+                                     json_object *previous, json_object *next)
+{
+    if (!m) return;
+    if (!m->switch_config || !inv->running || !previous || !next ||
+        !json_object_equal(m->switch_config, next)) {
+        failover_monitor_reset(m);
+        return;
+    }
+    json_object *policies = json_object_object_get(m->settings, "policies");
+    struct failover_policy switched;
+    if (failover_policy_parse(json_object_array_get_idx(policies, m->switched_row), &switched)) {
+        failover_monitor_reset(m);
+        return;
+    }
+    const struct outbound *updated = single_outbound(inv, switched.outbound);
+    if (!updated || strcmp(updated->members[0].key, m->switched_key)) {
+        failover_monitor_reset(m);
+        return;
+    }
+    /* Keep only already qualified rows whose assignment and Xray outbound
+     * did not change. A new check must confirm the condition after the switch. */
+    for (size_t i = 0; i < m->count; i++) {
+        struct status *status = &m->rows[i];
+        struct failover_policy policy;
+        if (i == m->switched_row || !status->ready ||
+            failover_policy_parse(json_object_array_get_idx(policies, i), &policy)) {
+            *status = (struct status){0};
+            continue;
+        }
+        const struct outbound *out = single_outbound(inv, policy.outbound);
+        const struct member *member = out ? &out->members[0] : NULL;
+        json_object *old_outbound = member ? node_config_outbound(previous, out, member) : NULL;
+        json_object *new_outbound = member ? node_config_outbound(next, out, member) : NULL;
+        if (!member || strcmp(member->key, status->streak.id) || !old_outbound || !new_outbound ||
+            !json_object_equal(old_outbound, new_outbound)) {
+            *status = (struct status){0};
+            continue;
+        }
+        status->ready = 0;
+        status->awaiting_sample = 1;
+    }
+    json_object_put(m->switch_config);
+    m->switch_config = NULL;
 }
 
 static enum failover_probe_state classify(const struct measurement *sample, long http_code)
@@ -158,6 +212,12 @@ static enum failover_probe_state classify(const struct measurement *sample, long
         !strcmp(sample->detail, "https_proxy_error"))
         return FAILOVER_FAILED;
     return FAILOVER_UNKNOWN;
+}
+
+static struct failover_sample active_sample(const struct member *member)
+{
+    return (struct failover_sample){.id = member->key, .state = classify(&member->https, member->http_code),
+                                    .ms = member->https.ms, .checked = member->https.checked};
 }
 
 static struct failover_sample probe_candidate(struct failover_monitor *m, const struct failover_node *node,
@@ -269,7 +329,16 @@ static int switch_candidate(struct failover_monitor *m, const struct failover_po
                 if (attempted) {
                     fprintf(stderr, "v2raya-helper: automatic server switch %s\n",
                             rc ? "was not confirmed" : "was confirmed");
-                    failover_monitor_reset(m);
+                    json_object *next = rc ? NULL : node_config_read(config_path);
+                    if (next && !json_object_equal(config, next)) {
+                        json_object_put(m->switch_config);
+                        m->switch_config = next;
+                        m->switched_row = (size_t)(status - m->rows);
+                        snprintf(m->switched_key, sizeof(m->switched_key), "%s", candidate->key);
+                    } else {
+                        json_object_put(next);
+                        failover_monitor_reset(m);
+                    }
                 }
             }
             json_object_put(fresh);
@@ -287,7 +356,9 @@ void failover_monitor_tick(struct failover_monitor *m, const struct inventory *i
                            const char *config_path, json_object *config)
 {
     if (!m) return;
-    if (!inv || !inv->running || !config) {
+    if (!inv || !inv->running || !config || m->switch_config) {
+        /* An unmatched confirmation means the following discovery did not
+         * observe the expected configuration transition. */
         failover_monitor_reset(m);
         return;
     }
@@ -295,22 +366,42 @@ void failover_monitor_tick(struct failover_monitor *m, const struct inventory *i
     if (!policies || !m->count) return;
     long max_age = 2 * m->https.interval + m->https.timeout;
     time_t now = time(NULL), last = last_attempt(m->last_path, now);
+    /* Evaluate every enabled row before the first attempt can restart Xray. */
     for (size_t i = 0; i < m->count; i++) {
+        struct status *status = &m->rows[i];
+        status->ready = 0;
         struct failover_policy policy;
         if (failover_policy_parse(json_object_array_get_idx(policies, i), &policy) ||
             policy.mode == FAILOVER_OFF) continue;
-        struct status *status = &m->rows[i];
-        const struct member *member = active_member(inv, policy.outbound);
-        if (!member) {
+        const struct outbound *out = single_outbound(inv, policy.outbound);
+        if (!out) {
             *status = (struct status){0};
             continue;
         }
-        struct failover_sample active = {.id = member->key, .state = classify(&member->https, member->http_code),
-            .ms = member->https.ms, .checked = member->https.checked};
+        const struct member *member = &out->members[0];
+        struct failover_sample active = active_sample(member);
+        if (status->awaiting_sample) {
+            if (!strcmp(member->key, status->streak.id) && !active.checked && member->https.state &&
+                !strcmp(member->https.state, "pending") && status->streak.checked <= now &&
+                difftime(now, status->streak.checked) <= max_age)
+                continue;
+            status->awaiting_sample = 0;
+            if (active.checked <= status->streak.checked)
+                *status = (struct status){0};
+        }
         failover_record(&status->streak, &policy, &active, now, max_age);
-        if (last < 0 || status->tried_sample == active.checked ||
-            !failover_policy_ready(&policy, &active, &status->streak, now, max_age, last))
-            continue;
+        status->ready = last >= 0 && failover_policy_ready(&policy, &active, &status->streak, now, max_age, last);
+    }
+    for (size_t i = 0; i < m->count; i++) {
+        struct status *status = &m->rows[i];
+        if (!status->ready) continue;
+        struct failover_policy policy;
+        if (failover_policy_parse(json_object_array_get_idx(policies, i), &policy)) continue;
+        const struct outbound *out = single_outbound(inv, policy.outbound);
+        if (!out) continue;
+        const struct member *member = &out->members[0];
+        struct failover_sample active = active_sample(member);
+        if (status->tried_sample == active.checked) continue;
         status->tried_sample = active.checked;
         if (switch_candidate(m, &policy, status, member, &active, max_age, config_path, config)) break;
     }

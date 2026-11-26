@@ -11,6 +11,8 @@ struct failover_monitor *failover_monitor_create(const char *path, const struct 
     const struct https_options *https, uint32_t mark, struct latency_history *history);
 void failover_monitor_free(struct failover_monitor *monitor);
 void failover_monitor_reset(struct failover_monitor *monitor);
+void failover_monitor_config_changed(struct failover_monitor *monitor, const struct inventory *inventory,
+                                     json_object *previous, json_object *next);
 void failover_monitor_tick(struct failover_monitor *monitor, const struct inventory *inventory,
                            const char *config_path, json_object *config);
 int failover_lock_settings(const char *lock_path);

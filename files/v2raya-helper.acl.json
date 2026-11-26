@@ -24,7 +24,7 @@
 		"description": "Read and configure v2rayA automatic server switching",
 		"read": {
 			"ubus": {
-				"v2raya-helper": [ "failover_context" ]
+				"v2raya-helper": [ "failover_context", "status", "latency" ]
 			}
 		},
 		"write": {

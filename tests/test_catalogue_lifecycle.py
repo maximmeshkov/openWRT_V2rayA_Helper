@@ -2,6 +2,7 @@
 import json
 import os
 import subprocess
+import time
 from urllib.parse import parse_qs, quote, urlsplit
 from unittest.mock import patch
 
@@ -24,6 +25,7 @@ class CatalogueLifecycle(NodeFixture):
         self.posts = []
         self.shares = []
         self.links = {}
+        self.after_switch = None
         base_reply = self.api.reply
         fixture = self
 
@@ -56,8 +58,10 @@ class CatalogueLifecycle(NodeFixture):
                     fixture.links.get(ref) is not None
                 )
                 if valid:
-                    fixture.set_active_locked(ref[0], ref[1], "correct")
+                    fixture.set_active_locked(ref[0], ref[1], "correct", request["outbound"])
                     status, response = base_reply("/ui/api/touch", handler.headers.get("Authorization"))
+                    if fixture.after_switch:
+                        fixture.after_switch(request["outbound"])
                 else:
                     status, response = 400, {"code": "FAIL"}
             body = json.dumps(response).encode()
@@ -95,19 +99,21 @@ class CatalogueLifecycle(NodeFixture):
         self.links = links
         self.api.names = ["proxy"]
 
-    def set_active_locked(self, sub, number, password):
-        outbounds = []
-        self.api.connected = []
+    def set_active_locked(self, sub, number, password, tag="proxy"):
+        config = json.loads(self.config.read_text()) if self.config.exists() else {"routing": {"rules": []}}
+        outbounds = [out for out in config.get("outbounds", []) if out["tag"] != tag]
+        self.api.connected = [ref for ref in self.api.connected or [] if ref["outbound"] != tag]
         if number is not None:
-            self.api.connected = [assignment("proxy", number, sub=sub)]
-            outbounds = [{
-                "tag": "proxy", "protocol": "socks", "settings": {"servers": [{
+            self.api.connected.append(assignment(tag, number, sub=sub))
+            outbounds.append({
+                "tag": tag, "protocol": "socks", "settings": {"servers": [{
                     "address": "127.0.0.1", "port": self.port,
                     "users": [{"user": "fixture", "pass": password}],
                 }]},
-            }]
+            })
         new = self.config.with_suffix(".new")
-        new.write_text(json.dumps({"outbounds": outbounds, "routing": {"rules": []}}))
+        config["outbounds"] = outbounds
+        new.write_text(json.dumps(config))
         new.replace(self.config)
 
     def command(self, endpoint, action, request=None):
@@ -153,6 +159,78 @@ class CatalogueLifecycle(NodeFixture):
     @staticmethod
     def names_to_keys(context):
         return {node["name"]: node["key"] for node in context["nodes"]}
+
+    def test_qualified_outbound_is_rechecked_after_switch_and_router_cooldown(self):
+        self.check_cooldown_followup(rotate_media=False)
+
+    def test_qualified_outbound_restarts_streak_if_its_core_profile_changes(self):
+        self.check_cooldown_followup(rotate_media=True)
+
+    def check_cooldown_followup(self, rotate_media):
+        with self.api.lock:
+            self.install_catalogue([
+                ("Primary", "wrong"), ("Secondary", "wrong"), ("Healthy", "correct"), ("Disabled", "wrong"),
+                ("Proxy reserve", "correct"), ("Media reserve", "correct"), ("Other reserve", "correct"),
+            ], [])
+            self.api.names.extend(["media", "healthy", "disabled"])
+            for index, (tag, password) in enumerate([
+                ("proxy", "wrong"), ("media", "wrong"), ("healthy", "correct"), ("disabled", "wrong"),
+            ], 1):
+                self.set_active_locked(None, index, password, tag)
+
+        keys = self.names_to_keys(self.catalogue())
+        for tag, mode, reserve in [
+            ("proxy", "outage", "Proxy reserve"), ("media", "outage", "Media reserve"),
+            ("healthy", "outage", "Other reserve"), ("disabled", "off", "Other reserve"),
+        ]:
+            saved = self.command("failover", "save", {"policy": {
+                "outbound": tag, "mode": mode, "candidates": [keys[reserve]],
+                "failure_method": "consecutive", "failures": 3, "allow_restart": True, "cooldown_seconds": 60,
+            }})
+            self.assertTrue(saved["ok"], saved)
+
+        def edit_media_during_first_switch(tag):
+            # The catalogue and assignment are unchanged, but the exact Xray
+            # profile for media now contains different credentials.
+            if tag == "proxy":
+                self.set_active_locked(None, 2, "wrong-after-edit", "media")
+
+        if rotate_media:
+            self.after_switch = edit_media_during_first_switch
+
+        def media_errors():
+            if not self.history_file.exists():
+                return []
+            return [sample for sample in history(self, self.history_file, "media")["samples"]
+                    if sample["state"] == "error" and sample["server"] == "Secondary"]
+
+        self.start_monitor(interval=3)
+        self.wait_for(lambda _: bool(media_errors()))
+        before = media_errors()[0]["series"]
+        self.wait_member("Proxy reserve", "ok")
+        self.wait_for(lambda _: any(sample["series"] != before for sample in media_errors()))
+        self.assertEqual([request["outbound"] for request in self.posts], ["proxy"])
+
+        # Simulate waiting for the global cooldown, without skipping the second outbound's fresh check.
+        marker = self.policy_file.with_suffix(".json.last")
+        attempted, unblock = map(int, marker.read_text().split())
+        self.assertEqual(unblock - attempted, 60)
+        self.assertGreater(unblock, time.time())
+        expired = int(time.time()) - 1
+        temp = marker.with_suffix(".tmp")
+        temp.write_text(f"{expired - 60} {expired}\n")
+        temp.replace(marker)
+
+        final = self.wait_for(lambda s: rows(s)["media"]["members"][0]["name"] == "Media reserve", timeout=16)
+        self.assertEqual([request["outbound"] for request in self.posts], ["proxy", "media"])
+        fresh_failures = [sample for sample in media_errors() if sample["series"] != before]
+        self.assertGreaterEqual(len(fresh_failures), 1)
+        if rotate_media:
+            self.assertGreaterEqual(len(fresh_failures), 3, "the edited outbound reused its previous failures")
+        else:
+            self.assertLess(len(fresh_failures), 3, "the unchanged outbound restarted its failure count")
+        for tag, name in [("proxy", "Proxy reserve"), ("healthy", "Healthy"), ("disabled", "Disabled")]:
+            self.assertEqual(rows(final)[tag]["members"][0]["name"], name)
 
     def test_catalogue_keys_survive_position_changes_and_stale_reserve_is_rejected(self):
         with self.api.lock:

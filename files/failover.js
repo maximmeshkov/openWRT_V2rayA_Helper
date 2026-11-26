@@ -2,6 +2,7 @@
 'require view';
 'require rpc';
 'require session';
+'require poll';
 
 var readContext = rpc.declare({
 	object: 'v2raya-helper',
@@ -15,6 +16,12 @@ var savePolicy = rpc.declare({
 	params: ['policy'],
 	expect: { '': {} },
 	reject: true
+});
+var readStatus = rpc.declare({
+	object: 'v2raya-helper', method: 'status', expect: { '': {} }, reject: true
+});
+var readHistory = rpc.declare({
+	object: 'v2raya-helper', method: 'latency', params: ['outbound'], expect: { '': {} }, reject: true
 });
 
 var candidateLimit = 64;
@@ -73,6 +80,17 @@ function matchesSaved(requested, stored) {
 	});
 }
 
+function activeReadings(reply, server) {
+	if (!reply || !Array.isArray(reply.samples) || !Number.isSafeInteger(reply.router_unix)) return null;
+	var samples = reply.samples.filter(function(sample) {
+		return sample && sample.role === 'active' && sample.server === server && typeof sample.series === 'string' &&
+			Number.isSafeInteger(sample.at) && sample.at > 0 && sample.at <= reply.router_unix;
+	}).sort(function(a, b) { return b.at - a.at; });
+	return { now: reply.router_unix, times: samples.length ? samples.filter(function(sample) {
+		return sample.series === samples[0].series;
+	}).map(function(sample) { return sample.at; }) : [] };
+}
+
 return view.extend({
 	handleSave: null,
 	handleSaveApply: null,
@@ -86,24 +104,23 @@ return view.extend({
 		var canWrite = L.hasViewPermission() === true;
 		var context, selected = session.getLocalData(outboundKey) || '', busy = false;
 		var drafts = new Map(), saved = new Map(), catalogue = new Map(), dirty = new Set(), unverified = new Map();
+		var timing = null, timingTarget = null, timingRequests = 0, timingBusy = false;
 		var outbound = E('select', { 'id': 'failover-outbound', 'class': 'cbi-input-select' });
-		var modeLabels = { off: _('Off'), outage: _('On repeated outages'), scheduled: _('Inside a time window') };
+		var modeLabels = { off: _('Off'), outage: _('On repeated outages'), scheduled: _('During scheduled hours') };
 		var mode = E('select', { 'id': 'failover-mode', 'class': 'cbi-input-select' }, [
 			option('off', modeLabels.off), option('outage', modeLabels.outage), option('scheduled', modeLabels.scheduled)
 		]);
 		var savedMode = E('p', { 'id': 'failover-saved-mode', 'class': 'cbi-section-descr', 'aria-live': 'polite' });
+		var cadence = E('p', { 'id': 'failover-check-cadence', 'class': 'cbi-section-descr' });
+		var recent = E('p', { 'id': 'failover-check-history', 'class': 'cbi-section-descr' });
+		var capacity = E('p', { 'id': 'failover-cadence-capacity', 'class': 'cbi-section-descr' });
 		var failures = rangeInput('failover-failures', 3, 30);
 		var failureMethod = E('select', { 'id': 'failover-failure-method', 'class': 'cbi-input-select' }, [
 			option('consecutive', _('Consecutive failures')),
-			option('window', _('Failures in a time window'))
+			option('window', _('Failures over the last N minutes'))
 		]);
 		var failureWindow = rangeInput('failover-failure-window', 1, 180);
-		var windowRow = E('div', {}, [
-			row(_('Failure window (minutes)'), failureWindow),
-			E('p', { 'class': 'cbi-section-descr' }, [
-				_('Choose a window long enough to contain the requested number of checks.')
-			])
-		]);
+		var windowRow = row(_('Count failures over (minutes)'), failureWindow);
 		var cooldown = rangeInput('failover-cooldown', 60, 86400);
 		var latency = rangeInput('failover-latency', 0, 60000);
 		var start = E('input', { 'id': 'failover-start', 'class': 'cbi-input-text', 'type': 'time' });
@@ -120,9 +137,9 @@ return view.extend({
 		}, [_('Remove unavailable selections')]);
 		var options = E('div', {}, [
 			row(_('How to count failures'), failureMethod),
-			row(_('Failed checks required'), failures),
-			windowRow,
-			row(_('Minimum time between switches (seconds)'), cooldown)
+			row(_('Failed checks required (3–30)'), failures),
+			windowRow, capacity,
+			row(_('Minimum pause between switches across all outbounds (seconds)'), cooldown)
 		]);
 		var schedule = E('div', {}, [
 			row(_('From (router time)'), start),
@@ -140,7 +157,7 @@ return view.extend({
 		]);
 		var fields = E('fieldset', { 'class': 'cbi-section' }, [
 			row(_('Current server'), current),
-			row(_('Mode'), mode), savedMode, options, schedule, confirmation
+			row(_('Mode'), mode), savedMode, cadence, recent, options, schedule, confirmation
 		]);
 		var candidateFields = E('fieldset', { 'class': 'cbi-section' }, [
 			row(_('Replacement servers'), search),
@@ -176,6 +193,79 @@ return view.extend({
 			showSavedMode();
 		}
 
+		function showTiming() {
+			if (!context || !selected) return;
+			if (!timingTarget || timingTarget.outbound !== selected) {
+				cadence.textContent = recent.textContent = capacity.textContent = '';
+				return;
+			}
+			var minutes = validInteger(failureWindow.value, 1, 180) ? Number(failureWindow.value) : 10;
+			var windowed = failureMethod.value === 'window';
+			var interval = timing && timing.interval;
+			var server = timing ? timing.server : timingTarget.server;
+			if (timing)
+				current.textContent = server || _('No single current server');
+			cadence.textContent = interval ? _('HTTPS checks wait at least %d seconds after each completed check. Queueing and request time can add to the gap.').format(interval) :
+				(timingBusy ? _('Loading HTTPS check timing…') : _('The configured HTTPS check interval is unavailable.'));
+			var history = timing && timing.readings;
+			if (history) {
+				var observed = history.times.filter(function(at) { return history.now - at <= minutes * 60; }).length;
+				recent.textContent = _('This server had %d HTTPS checks in the last %d minutes.').format(observed, minutes);
+				if (history.times.length > 1)
+					recent.textContent += ' ' + _('The latest two were %d seconds apart.').format(history.times[0] - history.times[1]);
+			} else {
+				recent.textContent = !server ? _('Switching requires one current server per outbound.') :
+					(timingBusy ? '' : _('Recent HTTPS checks for this server are unavailable.'));
+			}
+			capacity.className = 'cbi-section-descr';
+			capacity.textContent = '';
+			if (!interval || !server || !validInteger(failures.value, 3, 30)) return;
+			var required = Number(failures.value);
+			if (windowed && validInteger(failureWindow.value, 1, 180)) {
+				var maximum = Math.floor(minutes * 60 / interval) + 1;
+				capacity.textContent = _('At most %d checks fit in %d minutes at ideal spacing. The latest check must also fail.').format(maximum, minutes);
+				if (required > maximum) {
+					capacity.className = 'alert-message warning';
+					capacity.textContent += ' ' + _('A threshold of %d cannot be reached in this window.').format(required);
+				}
+			} else if (!windowed) {
+				capacity.textContent = _('The first and last of %d consecutive failures are at least %d seconds apart.').format(required, (required - 1) * interval);
+			}
+		}
+
+		function refreshTiming() {
+			if (!context || !selected) return Promise.resolve();
+			var item = context.outbounds.find(function(item) { return item.name === selected; });
+			var target = { outbound: selected, server: item && item.current || '' };
+			var changed = !timingTarget || target.outbound !== timingTarget.outbound || target.server !== timingTarget.server;
+			if (timingBusy && !changed) return Promise.resolve();
+			if (changed) timing = null;
+			timingTarget = target;
+			var id = ++timingRequests;
+			timingBusy = true;
+			showTiming();
+			return Promise.all([
+				readStatus().catch(function() { return null; }),
+				readHistory(target.outbound).catch(function() { return null; })
+			]).then(function(replies) {
+				if (id !== timingRequests) return;
+				timingBusy = false;
+				var info = replies[0], snapshot = info && info.snapshot;
+				var interval = snapshot && snapshot.node_check_interval;
+				var fresh = snapshot && Number.isSafeInteger(info.router_unix) &&
+					Date.parse(snapshot.fresh_until) > info.router_unix * 1000;
+				var server = target.server;
+				if (fresh && snapshot.state === 'ok' && Array.isArray(snapshot.outbounds)) {
+					var outbound = snapshot.outbounds.find(function(item) { return item.name === target.outbound; });
+					var members = outbound && outbound.members;
+					server = Array.isArray(members) && members.length === 1 ? members[0].name : '';
+				}
+				timing = { interval: fresh && Number.isSafeInteger(interval) && interval > 0 ? interval : null,
+					server: server, readings: server ? activeReadings(replies[1], server) : null };
+				showTiming();
+			});
+		}
+
 		function updateControls() {
 			var enabled = mode.value !== 'off';
 			fields.hidden = candidateFields.hidden = !selected;
@@ -189,6 +279,7 @@ return view.extend({
 			save.disabled = busy || !context || !selected || (enabled && !context.can_switch);
 			refresh.disabled = busy;
 			showSavedMode();
+			showTiming();
 		}
 
 		function rememberInputs() {
@@ -281,6 +372,7 @@ return view.extend({
 			}
 			showCandidates();
 			updateControls();
+			refreshTiming();
 		}
 
 		function populate(reply) {
@@ -443,6 +535,7 @@ return view.extend({
 			input.addEventListener('input', function() {
 				markEdited();
 				rememberInputs();
+				if (input === failures || input === failureWindow) showTiming();
 			});
 		});
 		search.addEventListener('input', showCandidates);
@@ -459,8 +552,7 @@ return view.extend({
 				populate(await readContext());
 			}, _('Could not refresh switching settings.'));
 		});
-		populate(initialContext);
-		return E('div', { 'class': 'cbi-map' }, [
+		var root = E('div', { 'class': 'cbi-map' }, [
 			E('h2', {}, [_('Server failover')]),
 			availability,
 			E('form', { 'submit': submit, 'novalidate': '' }, [
@@ -469,5 +561,15 @@ return view.extend({
 				status, candidateFields
 			])
 		]);
+		populate(initialContext);
+		function pollTiming() {
+			if (root.isConnected === false) {
+				poll.remove(pollTiming);
+				return Promise.resolve();
+			}
+			return refreshTiming();
+		}
+		poll.add(pollTiming, 30);
+		return root;
 	}
 });

@@ -64,6 +64,8 @@ static int publish(const char *path, const struct inventory *inv, const char *st
     if (message && *message) add_string(doc, "message", message);
     json_object_object_add(doc, "updated_at", timestamp(now));
     json_object_object_add(doc, "fresh_until", timestamp(now + ttl));
+    if (https->url)
+        json_object_object_add(doc, "node_check_interval", json_object_new_int64(https->interval));
     json_object_object_add(doc, "outbounds", rows);
     for (size_t i = 0; i < inv->count; ++i) {
         const struct outbound *out = &inv->outbounds[i];
@@ -167,7 +169,7 @@ static void sync_profiles(struct inventory *inv, const char *path, json_object *
 {
     json_object *next = node_config_read(path);
     if (!next || !*config || !json_object_equal(*config, next)) {
-        failover_monitor_reset(failover);
+        failover_monitor_config_changed(failover, inv, *config, next);
         ++*generation;
         for (size_t i = 0; i < inv->count; i++)
             for (size_t j = 0; j < inv->outbounds[i].count; j++) {
