@@ -8,10 +8,16 @@
  * before using this TLS transport. All strings live for the call's duration. */
 struct node_profile;
 
+enum xhttp_status {
+    XHTTP_EOF = 0,
+    XHTTP_SESSION_FAILED = 1, /* No complete VLESS response header. */
+    XHTTP_UNSUPPORTED = 2,
+    XHTTP_STREAM_FAILED = 3   /* Transport failed after VLESS answered. */
+};
+
 /* Blocks in a bounded worker while relaying an already-connected private
  * socketpair. Prepends the VLESS request and consumes the response header.
- * Caller retains ownership of stream_fd. Returns 0 on EOF,
- * 1 on transport failure, 2 for an unsupported profile or libcurl build. */
+ * Caller retains ownership of stream_fd. Returns an xhttp_status. */
 int xhttp_relay(const struct node_profile *ep, const unsigned char *prefix,
                 size_t prefix_len, int stream_fd, uint32_t mark, long timeout_ms);
 

@@ -43,6 +43,7 @@ function reading(result, route) {
 		else if (active && result.detail === 'https_tls_error') label = _('TLS error');
 		else if (active && result.detail === 'https_timeout') label = _('Timed out');
 		else if (active && result.detail === 'https_proxy_error') label = _('Proxy connection failed');
+		else if (active && result.detail === 'xhttp_session_failed') label = _('XHTTP connection failed');
 		else if (active && result.detail === 'https_connect_error') label = _('Connection failed');
 		else label = _('Probe error');
 		style = 'warning';

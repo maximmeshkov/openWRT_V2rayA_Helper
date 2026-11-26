@@ -5,6 +5,7 @@
 #include "xhttp_transport.h"
 #include <arpa/inet.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <signal.h>
 #include <stdlib.h>
 #include <string.h>
@@ -51,28 +52,54 @@ static size_t vless_request(unsigned char *buf, const struct node_profile *p,
 static int via_xhttp(struct node_profile *p, const struct https_options *opt, uint32_t mark,
                      struct node_https_result *result)
 {
+    enum { WORKER_SETUP_FAILED = XHTTP_STREAM_FAILED + 1 };
     unsigned char prefix[280];
     size_t len = vless_request(prefix, p, opt);
-    int fd[2];
+    long timeout_ms = opt->timeout * 1000;
+    int64_t deadline = probe_clock_ms() + timeout_ms;
+    int fd[2], report[2];
     if (!len || socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, fd)) return 0;
+    if (pipe2(report, O_NONBLOCK | O_CLOEXEC)) {
+        close(fd[0]);
+        close(fd[1]);
+        return 0;
+    }
     pid_t parent = getpid(), child = fork();
     if (!child) {
         close(fd[0]);
-        if (prctl(PR_SET_PDEATHSIG, SIGKILL) < 0 || getppid() != parent) _exit(1);
-        _exit(xhttp_relay(p, prefix, len, fd[1], mark, opt->timeout*1000));
+        close(report[0]);
+        unsigned char rc = WORKER_SETUP_FAILED;
+        if (prctl(PR_SET_PDEATHSIG, SIGKILL) == 0 && getppid() == parent)
+            rc = xhttp_relay(p, prefix, len, fd[1], mark, timeout_ms);
+        /* Publish the relay outcome before closing its copy of the byte stream.
+         * The inner TLS client can then distinguish EOF caused by this relay. */
+        ssize_t written;
+        do { written = write(report[1], &rc, 1); } while (written < 0 && errno == EINTR);
+        _exit(rc);
     }
     close(fd[1]);
-    int ok = child > 0 && node_https_fd(fd[0], opt->url, opt->timeout*1000, opt->code, result);
+    close(report[1]);
+    int ok = child > 0 && node_https_fd(fd[0], opt->url, timeout_ms, opt->code, result);
+    if (child > 0 && !ok && !result->http_code) {
+        unsigned char rc;
+        ssize_t n;
+        do { n = read(report[0], &rc, 1); } while (n < 0 && errno == EINTR);
+        if (n == 1) {
+            if (rc == XHTTP_SESSION_FAILED)
+                result->detail = probe_clock_ms() >= deadline ? "https_timeout" : "xhttp_session_failed";
+            else if (rc == XHTTP_UNSUPPORTED) result->detail = "unsupported_xhttp_transport";
+            else if (rc == WORKER_SETUP_FAILED) result->detail = "probe_unavailable";
+        }
+    }
+    close(report[0]);
     close(fd[0]);
     if (child > 0) {
-        int status = 0;
         pid_t done;
-        do { done = waitpid(child, &status, WNOHANG); } while (done < 0 && errno == EINTR);
+        do { done = waitpid(child, NULL, WNOHANG); } while (done < 0 && errno == EINTR);
         if (done == 0) {
             kill(child, SIGKILL);
             while (waitpid(child, NULL, 0) < 0 && errno == EINTR) {}
-        } else if (done == child && WIFEXITED(status) && WEXITSTATUS(status) == 2 && !ok)
-            result->detail = "unsupported_xhttp_transport";
+        }
     }
     return ok;
 }

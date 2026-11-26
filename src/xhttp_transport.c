@@ -230,6 +230,9 @@ static CURL *request(struct relay *r, int upload, int download, unsigned int seq
         curl_easy_setopt(c, CURLOPT_CONNECT_TO, r->connect) ||
         curl_easy_setopt(c, CURLOPT_HTTPHEADER, upload ? r->upload_headers : r->headers) ||
         curl_easy_setopt(c, CURLOPT_REFERER, referer) ||
+        /* Wait for the first TLS handshake so the concurrent XHTTP streams
+         * can share the negotiated HTTP/2 connection. */
+        (r->ep->http_version == 2 && curl_easy_setopt(c, CURLOPT_PIPEWAIT, 1L)) ||
         curl_easy_setopt(c, CURLOPT_HTTP_VERSION, r->ep->http_version == 2
                          ? (long)CURL_HTTP_VERSION_2TLS : (long)CURL_HTTP_VERSION_1_1) ||
         curl_easy_setopt(c, CURLOPT_SSL_VERIFYPEER, r->ep->allow_insecure ? 0L : 1L) ||
@@ -271,7 +274,7 @@ static int run(struct relay *r)
     char packet[8192];
     unsigned int seq = 0;
     int64_t next_post = 0;
-    int result = 1;
+    int result = XHTTP_SESSION_FAILED;
     if (!down) goto done;
     if (r->mode == STREAM_UP && !(up = request(r, 1, 0, 0, NULL, 0))) goto done;
     for (;;) {
@@ -293,7 +296,7 @@ static int run(struct relay *r)
             if (msg->msg != CURLMSG_DONE) continue;
             if (msg->data.result != CURLE_OK) goto done;
             if (msg->easy_handle == down) {
-                result = r->header_bytes == 2 && !r->addon_bytes ? 0 : 1;
+                if (r->header_bytes == 2 && !r->addon_bytes) result = XHTTP_EOF;
                 goto done;
             }
             if (r->mode == STREAM_UP && !r->eof) goto done;
@@ -318,25 +321,27 @@ static int run(struct relay *r)
 done:
     finish_request(r, &up);
     finish_request(r, &down);
+    if (result == XHTTP_SESSION_FAILED && r->header_bytes == 2 && !r->addon_bytes)
+        return XHTTP_STREAM_FAILED;
     return result;
 }
 
 int xhttp_relay(const struct node_profile *ep, const unsigned char *prefix,
                 size_t prefix_len, int stream_fd, uint32_t mark, long timeout_ms)
 {
-    if (!ep || !prefix || !prefix_len || timeout_ms <= 0 || timeout_ms > 600000) return 2;
+    if (!ep || !prefix || !prefix_len || timeout_ms <= 0 || timeout_ms > 600000) return XHTTP_UNSUPPORTED;
     const char *mode = ep->mode ? ep->mode : "";
     struct relay r = {.ep = ep, .fd = stream_fd, .mark = mark, .prefix = prefix,
         .prefix_left = prefix_len, .deadline = probe_clock_ms() + timeout_ms};
     if (!*mode || !strcmp(mode, "auto") || !strcmp(mode, "packet-up")) r.mode = PACKET_UP;
     else if (!strcmp(mode, "stream-up")) r.mode = STREAM_UP;
     else if (!strcmp(mode, "stream-one")) r.mode = STREAM_ONE;
-    else return 2;
-    if (ep->http_version != 1 && ep->http_version != 2) return 2;
-    if (ep->http_version == 1 && r.mode != PACKET_UP) return 2;
+    else return XHTTP_UNSUPPORTED;
+    if (ep->http_version != 1 && ep->http_version != 2) return XHTTP_UNSUPPORTED;
+    if (ep->http_version == 1 && r.mode != PACKET_UP) return XHTTP_UNSUPPORTED;
     if (ep->http_version == 2 && !(curl_version_info(CURLVERSION_NOW)->features & CURL_VERSION_HTTP2))
-        return 2;
-    int rc = 1;
+        return XHTTP_UNSUPPORTED;
+    int rc = XHTTP_SESSION_FAILED;
     r.multi = curl_multi_init();
     if (r.multi && setup_address(&r)) rc = run(&r);
     if (r.multi) curl_multi_cleanup(r.multi);
