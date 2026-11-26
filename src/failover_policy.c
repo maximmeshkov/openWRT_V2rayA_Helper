@@ -10,7 +10,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-enum { SETTINGS_LIMIT = 256 * 1024, POLICY_LIMIT = 128, CANDIDATE_LIMIT = 64 };
+enum { SETTINGS_LIMIT = 256 * 1024, POLICY_LIMIT = 128 };
 
 static const char *read_string(json_object *value)
 {
@@ -66,16 +66,16 @@ static int minute(const char *s, unsigned *out)
     return 1;
 }
 
-static int checked_candidates(json_object *candidates)
+static int checked_keys(json_object *keys)
 {
-    if (!json_object_is_type(candidates, json_type_array)) return 0;
-    size_t count = json_object_array_length(candidates);
-    if (count > CANDIDATE_LIMIT) return 0;
+    if (!json_object_is_type(keys, json_type_array)) return 0;
+    size_t count = json_object_array_length(keys);
+    if (count > FAILOVER_SELECTION_LIMIT) return 0;
     for (size_t i = 0; i < count; i++) {
-        const char *id = read_string(json_object_array_get_idx(candidates, i));
+        const char *id = read_string(json_object_array_get_idx(keys, i));
         if (!valid_id(id)) return 0;
         for (size_t j = 0; j < i; j++)
-            if (!strcmp(id, read_string(json_object_array_get_idx(candidates, j)))) return 0;
+            if (!strcmp(id, read_string(json_object_array_get_idx(keys, j)))) return 0;
     }
     return 1;
 }
@@ -92,7 +92,9 @@ int failover_policy_parse(json_object *entry, struct failover_policy *policy)
         .failure_window_minutes = FAILOVER_DEFAULT_WINDOW_MINUTES,
     };
     const char *mode = field(entry, "mode");
-    if (!mode || !valid_outbound(policy->outbound) || !checked_candidates(policy->candidates))
+    if (!mode || !valid_outbound(policy->outbound) || !checked_keys(policy->candidates) ||
+        (json_object_object_get_ex(entry, "subscriptions", &policy->subscriptions) &&
+         !checked_keys(policy->subscriptions)))
         return -1;
     if (!strcmp(mode, "off")) policy->mode = FAILOVER_OFF;
     else if (!strcmp(mode, "outage")) policy->mode = FAILOVER_OUTAGE;
@@ -275,11 +277,17 @@ static int window_open(const struct failover_policy *policy, time_t now)
     return m >= policy->start_minute || m < policy->end_minute;
 }
 
-static int selected(const struct failover_policy *policy, const char *id)
+static int listed(json_object *keys, const char *key)
 {
-    for (size_t i = 0; i < json_object_array_length(policy->candidates); i++)
-        if (!strcmp(id, read_string(json_object_array_get_idx(policy->candidates, i)))) return 1;
+    if (!keys || !key) return 0;
+    for (size_t i = 0; i < json_object_array_length(keys); i++)
+        if (!strcmp(key, read_string(json_object_array_get_idx(keys, i)))) return 1;
     return 0;
+}
+
+int failover_policy_selects(const struct failover_policy *policy, const char *id, const char *subscription)
+{
+    return listed(policy->candidates, id) || listed(policy->subscriptions, subscription);
 }
 
 int failover_policy_ready(const struct failover_policy *policy,
@@ -287,7 +295,8 @@ int failover_policy_ready(const struct failover_policy *policy,
                 time_t now, long maximum_age, time_t last_switch)
 {
     if (!policy || !streak || policy->mode == FAILOVER_OFF ||
-        !json_object_array_length(policy->candidates) ||
+        (!json_object_array_length(policy->candidates) &&
+         (!policy->subscriptions || !json_object_array_length(policy->subscriptions))) ||
         !fresh(active, now, maximum_age) || !valid_id(active->id) ||
         strcmp(active->id, streak->id) || active->checked != streak->checked || active->state != streak->latest ||
         (last_switch && difftime(now, last_switch) < policy->cooldown_seconds) ||
@@ -314,7 +323,8 @@ const char *failover_policy_choose(const struct failover_policy *policy,
     const struct failover_sample *best = NULL;
     for (size_t i = 0; i < count; i++) {
         const struct failover_sample *sample = &samples[i];
-        if (!valid_id(sample->id) || !strcmp(sample->id, active->id) || !selected(policy, sample->id) ||
+        if (!valid_id(sample->id) || !strcmp(sample->id, active->id) ||
+            !failover_policy_selects(policy, sample->id, sample->subscription) ||
             sample->state != FAILOVER_OK || sample->ms < 0 || !fresh(sample, now, maximum_age) ||
             sample->checked < active->checked ||
             (active->state == FAILOVER_OK && sample->ms > (long)policy->max_ms))

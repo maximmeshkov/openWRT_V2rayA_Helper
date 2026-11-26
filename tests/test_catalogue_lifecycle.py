@@ -77,7 +77,7 @@ class CatalogueLifecycle(NodeFixture):
     def tmp_path(self, name):
         return self.config.with_name(name)
 
-    def install_catalogue(self, manual, subscriptions):
+    def install_catalogue(self, manual, subscriptions, *, remarks=None):
         links = {}
 
         def servers(items, sub):
@@ -93,6 +93,7 @@ class CatalogueLifecycle(NodeFixture):
         self.api.servers = servers(manual, None)
         self.api.subscriptions = [
             {"id": number + 1, "_type": "subscription", "address": address,
+             "remarks": (remarks or {}).get(address, ""),
              "servers": servers(items, number)}
             for number, (address, items) in enumerate(subscriptions)
         ]
@@ -139,6 +140,12 @@ class CatalogueLifecycle(NodeFixture):
             "failure_method": "consecutive", "failures": 3, "allow_restart": True,
         }})
 
+    def save_subscription_policy(self, subscription, candidates=()):
+        return self.command("failover", "save", {"policy": {
+            "outbound": "proxy", "mode": "outage", "candidates": list(candidates),
+            "subscriptions": [subscription], "failures": 3, "allow_restart": True,
+        }})
+
     def start_monitor(self, interval=1):
         with patch.dict(os.environ, SSL_CERT_FILE=self.cert):
             self.start("--token-file", str(self.token), "--failover-file", str(self.policy_file),
@@ -159,6 +166,109 @@ class CatalogueLifecycle(NodeFixture):
     @staticmethod
     def names_to_keys(context):
         return {node["name"]: node["key"] for node in context["nodes"]}
+
+    def test_subscription_selection_follows_live_feed_without_reusing_its_old_index(self):
+        manual = [("Primary", "wrong"), ("Unselected manual", "correct")]
+        unrelated = (self.early_feed, [("Unselected reserve", "correct")])
+        with self.api.lock:
+            self.install_catalogue(manual, [unrelated, (self.main_feed, [("Old reserve", "wrong")])],
+                                   remarks={self.main_feed: "My selected feed"})
+            self.set_active_locked(None, 1, "wrong")
+
+        original = self.catalogue()["subscriptions"]
+        selected = next(item for item in original if item["name"] == "My selected feed")
+        key = selected["key"]
+        self.assertRegex(key, r"^[0-9a-f]{32}$")
+        self.assertEqual(selected["count"], 1)
+        self.assertTrue(self.save_subscription_policy(key)["ok"])
+        stored = self.catalogue()["policies"][0]
+        self.assertEqual((stored["subscriptions"], stored["candidates"]), ([key], []))
+        self.assertNotIn(self.main_feed, self.policy_file.read_text())
+
+        old_reserve = {"_type": "subscriptionServer", "id": 1, "sub": 1}
+        self.start_monitor()
+        self.wait_for(lambda _: old_reserve in self.shares, timeout=16)
+        self.assertTrue(all(share == old_reserve for share in self.shares))
+        self.assertFalse(self.posts)
+
+        # A healthy node in a different subscription now occupies exactly the
+        # old reserve's position. It must not inherit permission from the feed.
+        with self.api.lock:
+            self.install_catalogue(manual, [unrelated, (self.early_feed + "&replacement=1", [
+                ("Old reserve", "correct"),
+            ])])
+            share_count = len(self.shares)
+        unavailable = self.catalogue()
+        self.assertNotIn(key, {feed["key"] for feed in unavailable["subscriptions"]})
+        self.assertEqual(unavailable["policies"][0]["subscriptions"], [key])
+        self.assertFalse(self.save_subscription_policy(key)["ok"])
+        previous_failures = len(self.auth_failures)
+        self.wait_for(lambda _: len(self.auth_failures) >= previous_failures + 3, timeout=12)
+        self.assertEqual(len(self.shares), share_count)
+        self.assertFalse(self.posts)
+
+        # The chosen feed returns under a different label and index with a
+        # newly added server. The saved key still applies to this new member.
+        self.hold.set()
+        with self.api.lock:
+            self.install_catalogue(manual, [(self.main_feed, [("New reserve", "correct")]), unrelated],
+                                   remarks={self.main_feed: "Renamed selected feed"})
+        updated = self.catalogue()
+        self.assertIn({"key": key, "name": "Renamed selected feed", "count": 1}, updated["subscriptions"])
+        self.assertEqual(updated["policies"][0]["subscriptions"], [key])
+        self.assertTrue(self.waiting.wait(15), "new feed member did not receive its HTTPS probe")
+        self.assertFalse(self.posts, "the new member was assigned before its probe completed")
+        self.release.set()
+        final = self.wait_member("New reserve", "ok")
+        self.assertEqual(rows(final)["proxy"]["members"][0]["https"]["http_code"], 204)
+        self.assertEqual(self.posts, [{"_type": "subscriptionServer", "outbound": "proxy", "id": 1, "sub": 0}])
+        self.assertTrue(all(share == {"_type": "subscriptionServer", "id": 1, "sub": 0}
+                            for share in self.shares[share_count:]))
+
+    def test_subscription_selection_keeps_individually_selected_reserves(self):
+        with self.api.lock:
+            self.install_catalogue([("Primary", "wrong"), ("Manual reserve", "correct")],
+                                   [(self.main_feed, [])])
+            self.set_active_locked(None, 1, "wrong")
+        original = self.catalogue()
+        subscription = original["subscriptions"][0]["key"]
+        manual = self.names_to_keys(original)["Manual reserve"]
+        self.assertTrue(self.save_subscription_policy(subscription, [manual])["ok"])
+        stored = self.catalogue()["policies"][0]
+        self.assertEqual((stored["subscriptions"], stored["candidates"]), ([subscription], [manual]))
+        self.start_monitor()
+        self.wait_member("Manual reserve", "ok")
+        self.assertEqual(self.posts, [{"_type": "server", "outbound": "proxy", "id": 2}])
+
+    def test_subscription_becoming_ambiguous_during_probe_cannot_switch(self):
+        manual = [("Primary", "wrong")]
+        selected = (self.main_feed, [("Verified reserve", "correct")])
+        with self.api.lock:
+            self.install_catalogue(manual, [selected])
+            self.set_active_locked(None, 1, "wrong")
+        original = self.catalogue()
+        key = original["subscriptions"][0]["key"]
+        reserve = self.names_to_keys(original)["Verified reserve"]
+        saved = self.save_subscription_policy(key)
+        self.assertTrue(saved["ok"], saved)
+        self.hold.set()
+        self.start_monitor()
+        self.assertTrue(self.waiting.wait(15), "reserve never reached the HTTPS check")
+        try:
+            # The exact node key and its share URI remain valid. Only the
+            # subscription itself becomes ambiguous while the probe runs.
+            with self.api.lock:
+                self.install_catalogue(manual, [selected, (self.main_feed, [("Other reserve", "correct")])])
+            current = self.catalogue()
+            self.assertEqual(current["subscriptions"], [])
+            self.assertEqual(self.names_to_keys(current)["Verified reserve"], reserve)
+            self.assertEqual(current["policies"][0]["subscriptions"], [key])
+            self.assertFalse(self.save_subscription_policy(key)["ok"])
+        finally:
+            self.release.set()
+        previous_failures = len(self.auth_failures)
+        self.wait_for(lambda _: len(self.auth_failures) >= previous_failures + 2, timeout=12)
+        self.assertFalse(self.posts, "the successful probe from the ambiguous source authorized a switch")
 
     def test_qualified_outbound_is_rechecked_after_switch_and_router_cooldown(self):
         self.check_cooldown_followup(rotate_media=False)

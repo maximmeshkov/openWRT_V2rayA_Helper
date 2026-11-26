@@ -1,9 +1,33 @@
 #include "failover_api.h"
 #include "node_key.h"
+#include "utf8.h"
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+struct catalogue_key {
+    const char *key;
+    size_t index;
+};
+
+static int compare_keys(const void *left, const void *right)
+{
+    const struct catalogue_key *a = left, *b = right;
+    return strcmp(a->key, b->key);
+}
+
+static const struct catalogue_key *find_unique_key(const struct catalogue_key *keys,
+                                                   size_t count, const char *key)
+{
+    if (!key || !count) return NULL;
+    struct catalogue_key wanted = {.key = key};
+    const struct catalogue_key *found = bsearch(&wanted, keys, count, sizeof(*keys), compare_keys);
+    if (!found || (found > keys && !compare_keys(found - 1, found)) ||
+        (found + 1 < keys + count && !compare_keys(found, found + 1)))
+        return NULL;
+    return found;
+}
 
 static const char *text(json_object *object, const char *field)
 {
@@ -17,6 +41,17 @@ static int64_t integer(json_object *object, const char *field)
 {
     json_object *value = json_object_object_get(object, field);
     return json_object_is_type(value, json_type_int) ? json_object_get_int64(value) : -1;
+}
+
+static const char *subscription_name(json_object *subscription, const char *source)
+{
+    const char *remarks = text(subscription, "remarks");
+    if (!remarks || !*remarks || strstr(remarks, source) || strstr(remarks, "://"))
+        return NULL;
+    size_t length = strnlen(remarks, 257);
+    if (length > 256 || !valid_utf8(remarks, length) || strcspn(remarks, "\r\n\t") != length)
+        return NULL;
+    return remarks;
 }
 
 static int append_nodes(struct failover_catalogue *cat, json_object *servers, int64_t sub,
@@ -70,12 +105,30 @@ static int parse_catalogue(json_object *data, struct failover_catalogue *cat, ch
     if (!append_nodes(cat, json_object_object_get(touch, "servers"), -1, "", &capacity)) goto bad;
     size_t count = json_object_array_length(subs);
     if (count > INT_MAX) goto bad;
+    cat->subscriptions = calloc(count, sizeof(*cat->subscriptions));
+    cat->subscription_keys = calloc(count, sizeof(*cat->subscription_keys));
+    if (count && (!cat->subscriptions || !cat->subscription_keys)) goto bad;
+    cat->subscription_count = count;
     for (size_t i = 0; i < count; i++) {
         json_object *sub = json_object_array_get_idx(subs, i);
-        const char *key = text(sub, "address"), *type = text(sub, "_type");
-        if (!key || !*key || !type || strcmp(type, "subscription") || integer(sub, "id") != (int64_t)i + 1 ||
-            !append_nodes(cat, json_object_object_get(sub, "servers"), (int64_t)i, key, &capacity)) goto bad;
+        const char *source = text(sub, "address"), *type = text(sub, "_type");
+        json_object *servers = NULL;
+        if (!source || !*source || !type || strcmp(type, "subscription") || integer(sub, "id") != (int64_t)i + 1 ||
+            !json_object_object_get_ex(sub, "servers", &servers)) goto bad;
+        struct failover_subscription *subscription = &cat->subscriptions[i];
+        subscription->first = cat->count;
+        if (servers && !append_nodes(cat, servers, (int64_t)i, source, &capacity)) goto bad;
+        subscription->count = cat->count - subscription->first;
+        subscription->name = subscription_name(sub, source);
+        node_key(subscription->key, "subscription", source, "", "", "");
+        cat->subscription_keys[i] = (struct catalogue_key){.key=subscription->key, .index=i};
     }
+    cat->node_keys = calloc(cat->count, sizeof(*cat->node_keys));
+    if (cat->count && !cat->node_keys) goto bad;
+    for (size_t i = 0; i < cat->count; i++)
+        cat->node_keys[i] = (struct catalogue_key){.key=cat->nodes[i].key, .index=i};
+    if (cat->count > 1) qsort(cat->node_keys, cat->count, sizeof(*cat->node_keys), compare_keys);
+    if (count > 1) qsort(cat->subscription_keys, count, sizeof(*cat->subscription_keys), compare_keys);
     return 0;
 bad:
     failover_catalogue_free(cat);
@@ -92,19 +145,23 @@ void failover_catalogue_free(struct failover_catalogue *cat)
 {
     json_object_put(cat->data);
     free(cat->nodes);
+    free(cat->subscriptions);
+    free(cat->node_keys);
+    free(cat->subscription_keys);
     *cat = (struct failover_catalogue){0};
 }
 
 const struct failover_node *failover_catalogue_find(const struct failover_catalogue *cat, const char *key)
 {
-    const struct failover_node *found = NULL;
-    for (size_t i = 0; i < cat->count; i++) {
-        const struct failover_node *node = &cat->nodes[i];
-        if (strcmp(key, node->key)) continue;
-        if (found) return NULL;
-        found = node;
-    }
-    return found;
+    const struct catalogue_key *found = find_unique_key(cat->node_keys, cat->count, key);
+    return found ? &cat->nodes[found->index] : NULL;
+}
+
+const struct failover_subscription *failover_catalogue_subscription(const struct failover_catalogue *cat,
+                                                                   const char *key)
+{
+    const struct catalogue_key *found = find_unique_key(cat->subscription_keys, cat->subscription_count, key);
+    return found ? &cat->subscriptions[found->index] : NULL;
 }
 
 const struct failover_node *failover_catalogue_active(const struct failover_catalogue *cat, const char *outbound)
@@ -194,7 +251,8 @@ int failover_api_can_switch(const struct v2raya_api *api, char *error, size_t le
 
 int failover_api_connect(const struct v2raya_api *api, const char *outbound,
                          const struct failover_node *expected_active, const struct failover_node *candidate,
-                         const char *expected_profile, int (*permitted)(void *), void *context,
+                         const char *expected_profile, const char *expected_subscription,
+                         int (*permitted)(void *), void *context,
                          char *error, size_t len)
 {
     if (!outbound || !*outbound || !expected_active || !candidate || !expected_profile || !*expected_profile ||
@@ -211,6 +269,14 @@ int failover_api_connect(const struct v2raya_api *api, const char *outbound,
     if (!cat.running || !same_node(active, expected_active) || !same_node(next, candidate)) {
         snprintf(error, len, "v2rayA assignment or candidate changed before failover");
         goto done;
+    }
+    if (expected_subscription) {
+        const struct failover_subscription *sub = failover_catalogue_subscription(&cat, expected_subscription);
+        size_t index = (size_t)(next - cat.nodes);
+        if (!sub || index < sub->first || index - sub->first >= sub->count) {
+            snprintf(error, len, "selected subscription changed or became ambiguous before failover");
+            goto done;
+        }
     }
     char *profile = failover_api_profile(api, next, error, len);
     if (!profile) goto done;

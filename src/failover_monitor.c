@@ -287,6 +287,52 @@ static int permit_switch(void *opaque)
     return 1;
 }
 
+struct candidate_pool {
+    const struct failover_subscription *groups[FAILOVER_SELECTION_LIMIT];
+    size_t group_count, explicit_count, total_count;
+};
+
+static struct candidate_pool selected_pool(const struct failover_catalogue *catalog,
+                                           const struct failover_policy *policy)
+{
+    struct candidate_pool pool = {.explicit_count = json_object_array_length(policy->candidates)};
+    pool.total_count = pool.explicit_count;
+    size_t count = policy->subscriptions ? json_object_array_length(policy->subscriptions) : 0;
+    for (size_t i = 0; i < count; i++) {
+        const char *key = json_object_get_string(json_object_array_get_idx(policy->subscriptions, i));
+        const struct failover_subscription *group = failover_catalogue_subscription(catalog, key);
+        if (!group || !group->count) continue;
+        pool.groups[pool.group_count++] = group;
+        pool.total_count += group->count;
+    }
+    return pool;
+}
+
+static const struct failover_node *pool_candidate(const struct candidate_pool *pool,
+    const struct failover_catalogue *catalog, const struct failover_policy *policy, size_t index,
+    const char **subscription)
+{
+    *subscription = NULL;
+    if (index < pool->explicit_count) {
+        const char *key = json_object_get_string(json_object_array_get_idx(policy->candidates, index));
+        return failover_catalogue_find(catalog, key);
+    }
+    index -= pool->explicit_count;
+    for (size_t i = 0; i < pool->group_count; i++) {
+        const struct failover_subscription *group = pool->groups[i];
+        if (index >= group->count) {
+            index -= group->count;
+            continue;
+        }
+        const struct failover_node *node = &catalog->nodes[group->first + index];
+        if (failover_policy_selects(policy, node->key, NULL) || failover_catalogue_find(catalog, node->key) != node)
+            return NULL;
+        *subscription = group->key;
+        return node;
+    }
+    return NULL;
+}
+
 static int switch_candidate(struct failover_monitor *m, const struct failover_policy *policy,
     struct status *status, const struct member *member, const struct failover_sample *active, long max_age,
     const char *config_path, json_object *config)
@@ -303,17 +349,21 @@ static int switch_candidate(struct failover_monitor *m, const struct failover_po
             !strcmp(node->key, member->key)) current = node;
     }
     if (!current) goto done;
-    size_t count = json_object_array_length(policy->candidates);
-    for (size_t i = 0; i < count; i++) {
-        size_t index = status->next_candidate++ % count;
-        const char *key = json_object_get_string(json_object_array_get_idx(policy->candidates, index));
-        const struct failover_node *candidate = failover_catalogue_find(&catalog, key);
-        if (!candidate || (candidate->id == current->id && candidate->sub == current->sub))
-            continue;
+    struct candidate_pool pool = selected_pool(&catalog, policy);
+    for (size_t i = 0; i < pool.total_count; i++) {
+        size_t index = status->next_candidate++ % pool.total_count;
+        const char *subscription;
+        const struct failover_node *candidate = pool_candidate(&pool, &catalog, policy, index, &subscription);
+        if (!candidate || candidate == current) continue;
         char *link = failover_api_profile(&m->api, candidate, error, sizeof(error));
-        if (!link) continue;
+        if (!link) {
+            /* A large feed must not trigger a burst of profile exports. */
+            if (subscription) break;
+            continue;
+        }
         struct failover_sample result = probe_candidate(m, candidate, policy->outbound, link);
-        result.id = key;
+        result.id = candidate->key;
+        result.subscription = subscription;
         int lock = failover_lock_settings(m->lock_path);
         if (lock >= 0) {
             json_object *fresh = failover_settings_read(m->path);
@@ -323,7 +373,7 @@ static int switch_candidate(struct failover_monitor *m, const struct failover_po
                 struct switch_gate gate = {.monitor = m, .policy = policy, .status = status,
                     .active = active, .candidate = &result, .config_path = config_path,
                     .config = config, .max_age = max_age};
-                int rc = failover_api_connect(&m->api, policy->outbound, current, candidate, link,
+                int rc = failover_api_connect(&m->api, policy->outbound, current, candidate, link, subscription,
                                                permit_switch, &gate, error, sizeof(error));
                 attempted = gate.attempted;
                 if (attempted) {

@@ -25,6 +25,7 @@ var readHistory = rpc.declare({
 });
 
 var candidateLimit = 64;
+var subscriptionLimit = 64;
 var outboundKey = 'v2raya-helper-failover-outbound';
 
 function row(title, control) {
@@ -47,12 +48,13 @@ function rangeInput(id, min, max) {
 
 function newPolicy(outbound, saved) {
 	var policy = Object.assign({
-		outbound: outbound, mode: 'off', candidates: [], failures: 3,
+		outbound: outbound, mode: 'off', candidates: [], subscriptions: [], failures: 3,
 		failure_method: 'consecutive', failure_window_minutes: 10,
 		max_ms: 0, cooldown_seconds: 900, start: '', end: ''
 	}, saved || {});
 	policy.outbound = outbound;
 	policy.candidates = policy.candidates.slice();
+	policy.subscriptions = policy.subscriptions.slice();
 	return policy;
 }
 
@@ -76,9 +78,9 @@ function validContext(reply) {
 function matchesSaved(requested, stored) {
 	return stored && Object.keys(requested).every(function(field) {
 		if (field === 'allow_restart') return true;
-		if (field === 'candidates')
-			return Array.isArray(stored.candidates) && requested.candidates.length === stored.candidates.length &&
-				requested.candidates.every(function(key, index) { return key === stored.candidates[index]; });
+		if (field === 'candidates' || field === 'subscriptions')
+			return Array.isArray(stored[field]) && requested[field].length === stored[field].length &&
+				requested[field].every(function(key, index) { return key === stored[field][index]; });
 		return requested[field] === stored[field];
 	});
 }
@@ -107,6 +109,7 @@ return view.extend({
 		var canWrite = L.hasViewPermission() === true;
 		var context, selected = session.getLocalData(outboundKey) || '', busy = false;
 		var drafts = new Map(), saved = new Map(), catalogue = new Map(), dirty = new Set(), unverified = new Map();
+		var subscriptionCatalogue = new Map();
 		var restartConsent = new Set();
 		var timing = null, timingTarget = null, timingRequests = 0, timingBusy = false;
 		var outbound = E('select', { 'id': 'failover-outbound', 'class': 'cbi-input-select' });
@@ -145,6 +148,11 @@ return view.extend({
 			'placeholder': _('Filter servers')
 		});
 		var list = E('div', { 'class': 'cbi-value-field', 'style': 'max-height:22rem;overflow:auto' });
+		var subscriptionChoices = E('div', { 'id': 'failover-subscription-choices', 'class': 'cbi-value-field' });
+		var subscriptionSection = E('div', { 'class': 'cbi-value' }, [
+			E('h3', {}, [_('Any server from a subscription')]),
+			subscriptionChoices
+		]);
 		var count = E('p');
 		var removeUnavailable = E('button', {
 			'id': 'failover-remove-unavailable', 'type': 'button', 'class': 'btn cbi-button cbi-button-neutral'
@@ -175,6 +183,7 @@ return view.extend({
 			row(_('Mode'), mode), savedMode, cadence, recent, options, schedule, confirmation
 		]);
 		var candidateFields = E('fieldset', { 'class': 'cbi-section' }, [
+			subscriptionSection,
 			row(_('Replacement servers'), search),
 			E('div', { 'style': 'display:flex;flex-wrap:wrap;align-items:baseline;gap:.5em' }, [count, removeUnavailable]),
 			list
@@ -383,10 +392,56 @@ return view.extend({
 			showCandidateCount();
 		}
 
+		function showSubscriptions() {
+			subscriptionChoices.textContent = '';
+			subscriptionSection.hidden = !draft() || !context || !Array.isArray(context.subscriptions);
+			if (subscriptionSection.hidden) return;
+			var chosen = new Set(draft().subscriptions);
+
+			function choice(key, label, missing) {
+				var checkbox = E('input', { 'type': 'checkbox' });
+				checkbox.checked = chosen.has(key);
+				checkbox.addEventListener('change', function() {
+					if (checkbox.checked) {
+						if (chosen.size >= subscriptionLimit) {
+							checkbox.checked = false;
+							message(_('Select at most 64 subscriptions.'), true);
+							return;
+						}
+						chosen.add(key);
+					} else {
+						chosen.delete(key);
+					}
+					draft().subscriptions = Array.from(chosen);
+					markEdited();
+					showCandidateCount();
+					if (missing) showSubscriptions();
+				});
+				subscriptionChoices.appendChild(E('div', { 'class': 'cbi-value' }, [E('label', {}, [checkbox, ' ', label])]));
+			}
+
+			subscriptionCatalogue.forEach(function(source, key) {
+				choice(key, source.name + ' · ' + _('Servers: %d').format(source.count), false);
+			});
+			chosen.forEach(function(key) {
+				if (!subscriptionCatalogue.has(key))
+					choice(key, _('Selected subscription unavailable. Deselect to remove it.'), true);
+			});
+			if (!subscriptionCatalogue.size && !chosen.size)
+				subscriptionChoices.appendChild(E('p', {}, [context.catalog_unavailable ? _('Subscription list unavailable.') : _('No subscriptions available.')]));
+			else if (subscriptionCatalogue.size)
+				subscriptionChoices.appendChild(E('p', { 'class': 'cbi-section-descr' }, [_('Includes servers added in future subscription updates.')]));
+		}
+
 		function showCandidateCount() {
 			var chosen = draft().candidates;
 			var missing = chosen.filter(function(key) { return !catalogue.has(key); }).length;
+			var subscriptions = draft().subscriptions;
+			if (Array.isArray(context.subscriptions))
+				missing += subscriptions.filter(function(key) { return !subscriptionCatalogue.has(key); }).length;
 			count.textContent = _('Selected servers: %d').format(chosen.length);
+			if (subscriptions.length)
+				count.textContent += ' · ' + _('Subscriptions: %d').format(subscriptions.length);
 			removeUnavailable.hidden = !missing || context.catalog_unavailable || !canWrite;
 			if (missing && !context.catalog_unavailable)
 				count.textContent += ' · ' + _('Unavailable: %d').format(missing);
@@ -411,6 +466,7 @@ return view.extend({
 				var target = context.outbounds.find(function(item) { return item.name === selected; });
 				current.textContent = target && target.current || _('No single current server');
 			}
+			showSubscriptions();
 			showCandidates();
 			showPresetSources();
 			updateControls();
@@ -429,6 +485,8 @@ return view.extend({
 			}
 			context = reply;
 			catalogue = new Map();
+			subscriptionCatalogue = new Map((Array.isArray(reply.subscriptions) ? reply.subscriptions : [])
+				.map(function(source) { return [source.key, source]; }));
 			var ambiguous = new Set();
 			reply.nodes.forEach(function(node) {
 				if (catalogue.has(node.key)) {
@@ -493,10 +551,13 @@ return view.extend({
 				candidates: input.candidates,
 				allow_restart: false
 			};
+			if (Array.isArray(context.subscriptions)) policy.subscriptions = input.subscriptions;
 			if (input.mode !== 'off') {
-				if (!policy.candidates.length ||
-				    policy.candidates.some(function(key) { return !catalogue.has(key); })) {
-					message(_('Choose at least one available replacement server and remove unavailable selections.'), true);
+				var subscriptions = policy.subscriptions || [];
+				if ((!policy.candidates.length && !subscriptions.length) ||
+				    policy.candidates.some(function(key) { return !catalogue.has(key); }) ||
+				    subscriptions.some(function(key) { return !subscriptionCatalogue.has(key); })) {
+					message(_('Choose a replacement server or subscription and remove unavailable selections.'), true);
 					return;
 				}
 				if (!validInteger(input.failures, 3, 30) || !validInteger(input.cooldown_seconds, 60, 86400)) {
@@ -598,9 +659,12 @@ return view.extend({
 		removeUnavailable.addEventListener('click', function() {
 			if (!draft() || !canWrite || busy || !context || context.catalog_unavailable) return;
 			draft().candidates = draft().candidates.filter(function(key) { return catalogue.has(key); });
+			if (Array.isArray(context.subscriptions))
+				draft().subscriptions = draft().subscriptions.filter(function(key) { return subscriptionCatalogue.has(key); });
 			markEdited();
+			showSubscriptions();
 			showCandidates();
-			message(_('Unavailable servers removed from this draft. Save to apply.'), false);
+			message(_('Unavailable selections removed from this draft. Save to apply.'), false);
 		});
 		refresh.addEventListener('click', function() {
 			rememberInputs();

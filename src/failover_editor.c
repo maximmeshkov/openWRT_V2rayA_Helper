@@ -27,16 +27,22 @@ static const char *store_policy(const char *path, const struct inventory *inv,
         (policy.mode != FAILOVER_OFF && (!inv || !outbound_exists(inv, policy.outbound))))
         return "Choose an outbound and valid switching settings";
     size_t count = json_object_array_length(policy.candidates);
+    size_t subscriptions = policy.subscriptions ? json_object_array_length(policy.subscriptions) : 0;
     if (policy.mode != FAILOVER_OFF) {
         json_object *permission = json_object_object_get(policy_entry, "allow_restart");
         if (!json_object_is_type(permission, json_type_boolean) || !json_object_get_boolean(permission))
             return "Confirm permission to restart Xray when this policy switches servers";
         if (!can_switch) return "Automatic switching is unavailable for this v2rayA version or core";
-        if (!count) return "Select at least one server eligible for switching";
+        if (!count && !subscriptions) return "Select at least one replacement server or subscription";
         for (size_t i = 0; i < count; i++) {
             const char *key = json_object_get_string(json_object_array_get_idx(policy.candidates, i));
             if (!failover_catalogue_find(catalog, key))
                 return "A selected server was removed or is ambiguous. Reload the list.";
+        }
+        for (size_t i = 0; i < subscriptions; i++) {
+            const char *key = json_object_get_string(json_object_array_get_idx(policy.subscriptions, i));
+            if (!failover_catalogue_subscription(catalog, key))
+                return "A selected subscription was removed or is ambiguous. Reload the list.";
         }
     }
 
@@ -48,7 +54,7 @@ static const char *store_policy(const char *path, const struct inventory *inv,
     json_object *settings = failover_settings_read(path);
     const char *failure = "Cannot save switching settings";
     if (settings) {
-        const char *const fields[] = {"outbound", "mode", "candidates", "failures", "failure_method",
+        const char *const fields[] = {"outbound", "mode", "candidates", "subscriptions", "failures", "failure_method",
                                      "failure_window_minutes",
                                      "max_ms", "cooldown_seconds", "start", "end"};
         json_object *entry = json_object_new_object();
@@ -76,8 +82,10 @@ static const char *show_failover(json_object *reply, const char *path,
     json_object *settings = failover_settings_read(path);
     if (!settings) return "Cannot read switching settings";
     json_object *outbounds = json_object_new_array(), *nodes = json_object_new_array();
+    json_object *subscriptions = json_object_new_array();
     json_object_object_add(reply, "outbounds", outbounds);
     json_object_object_add(reply, "nodes", nodes);
+    json_object_object_add(reply, "subscriptions", subscriptions);
     json_object *policies = json_object_object_get(settings, "policies");
     json_object_object_add(reply, "policies", json_object_get(policies));
     if (version) add_text(reply, "version", version);
@@ -98,6 +106,17 @@ static const char *show_failover(json_object *reply, const char *path,
         add_text(entry, "address", node->address);
         add_text(entry, "net", node->net);
         json_object_array_add(nodes, entry);
+    }
+    for (size_t i = 0; catalog && i < catalog->subscription_count; i++) {
+        const struct failover_subscription *subscription = &catalog->subscriptions[i];
+        if (!failover_catalogue_subscription(catalog, subscription->key)) continue;
+        char fallback[40];
+        snprintf(fallback, sizeof(fallback), "Subscription %zu", i + 1);
+        json_object *entry = json_object_new_object();
+        add_text(entry, "key", subscription->key);
+        add_text(entry, "name", subscription->name ? subscription->name : fallback);
+        json_object_object_add(entry, "count", json_object_new_int64((int64_t)subscription->count));
+        json_object_array_add(subscriptions, entry);
     }
     for (size_t i = 0; i < json_object_array_length(policies); i++) {
         const char *name = rpc_string(json_object_array_get_idx(policies, i), "outbound");

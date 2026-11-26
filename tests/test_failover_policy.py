@@ -14,12 +14,13 @@ class Policy(C.Structure):
     _fields_ = [("mode", C.c_int), ("failures", C.c_uint), ("max_ms", C.c_uint),
                 ("cooldown", C.c_uint), ("start", C.c_uint), ("end", C.c_uint),
                 ("outbound", C.c_char_p), ("candidates", C.c_void_p),
-                ("failure_method", C.c_int), ("failure_window_minutes", C.c_uint)]
+                ("failure_method", C.c_int), ("failure_window_minutes", C.c_uint),
+                ("subscriptions", C.c_void_p)]
 
 
 class Sample(C.Structure):
     _fields_ = [("id", C.c_char_p), ("state", C.c_int), ("ms", C.c_long),
-                ("checked", C.c_long)]
+                ("checked", C.c_long), ("subscription", C.c_char_p)]
 
 
 class Streak(C.Structure):
@@ -158,6 +159,25 @@ class FailoverPolicyTest(unittest.TestCase):
         self.record(p, streak, changed, NOW + 3)
         self.assertFalse(self.ready(p, streak, changed, now=NOW + 3))
 
+    def test_subscription_candidates_require_selected_source_and_probe_confirmation(self):
+        p = self.policy(candidates=[], subscriptions=["chosen-feed"])
+        streak, failure = self.streak(p)
+        self.assertTrue(self.ready(p, streak, failure))
+        self.assertIsNone(self.chosen(p, streak, failure,
+                                      Sample(b"main", OK, 1, NOW, b"chosen-feed"),
+                                      Sample(b"old", OK, 2, NOW - 1, b"chosen-feed"),
+                                      Sample(b"other", OK, 3, NOW, b"other-feed"),
+                                      Sample(b"manual", OK, 4, NOW),
+                                      Sample(b"failed", FAILED, 5, NOW, b"chosen-feed")))
+        self.assertEqual(self.chosen(p, streak, failure,
+                                     Sample(b"new", OK, 6, NOW, b"chosen-feed")), b"new")
+
+        union = self.policy(candidates=["manual"], subscriptions=["chosen-feed"])
+        streak, failure = self.streak(union)
+        self.assertEqual(self.chosen(union, streak, failure,
+                                     Sample(b"new", OK, 6, NOW, b"chosen-feed"),
+                                     Sample(b"manual", OK, 4, NOW)), b"manual")
+
     def test_scheduled_rolling_window_keeps_only_the_latest_thirty_failures(self):
         p = self.policy(mode="scheduled", start="23:58", end="00:01", failures=30,
                         failure_method="window", failure_window_minutes=1)
@@ -197,6 +217,9 @@ class FailoverPolicyTest(unittest.TestCase):
                           {"failure_method": "sliding"}, {"failure_method": None},
                           {"failure_window_minutes": 0}, {"failure_window_minutes": 181},
                           {"failure_window_minutes": "10"}, {"candidates": ["same", "same"]},
+                          {"subscriptions": None}, {"subscriptions": "feed"},
+                          {"subscriptions": ["same", "same"]},
+                          {"subscriptions": list(map(str, range(65)))},
                           {"mode": "scheduled", "start": "24:00", "end": "06:00"},
                           {"mode": "scheduled", "start": "05:00", "end": "05:00"}):
             with self.subTest(overrides=overrides):
