@@ -104,6 +104,7 @@ return view.extend({
 		var canWrite = L.hasViewPermission() === true;
 		var context, selected = session.getLocalData(outboundKey) || '', busy = false;
 		var drafts = new Map(), saved = new Map(), catalogue = new Map(), dirty = new Set(), unverified = new Map();
+		var restartConsent = new Set();
 		var timing = null, timingTarget = null, timingRequests = 0, timingBusy = false;
 		var outbound = E('select', { 'id': 'failover-outbound', 'class': 'cbi-input-select' });
 		var modeLabels = { off: _('Off'), outage: _('On repeated outages'), scheduled: _('During scheduled hours') };
@@ -150,10 +151,11 @@ return view.extend({
 			])
 		]);
 		var confirm = E('input', { 'id': 'failover-confirm', 'type': 'checkbox' });
+		var consentStatus = E('span', { 'aria-live': 'polite' });
 		var confirmation = E('p', { 'class': 'alert-message warning' }, [
 			E('label', { 'for': confirm.id }, [
 				confirm, ' ', _('I allow automatic switches to restart Xray and interrupt its connections.')
-			])
+			]), consentStatus
 		]);
 		var fields = E('fieldset', { 'class': 'cbi-section' }, [
 			row(_('Current server'), current),
@@ -190,7 +192,8 @@ return view.extend({
 		function markEdited() {
 			dirty.add(selected);
 			unverified.delete(selected);
-			showSavedMode();
+			message('', false);
+			updateControls();
 		}
 
 		function showTiming() {
@@ -266,6 +269,13 @@ return view.extend({
 			});
 		}
 
+		function updateConsent() {
+			confirmation.hidden = !context || !canWrite || mode.value === 'off' || !dirty.has(selected);
+			confirm.checked = restartConsent.has(selected);
+			confirmation.className = confirm.checked ? 'cbi-section-descr' : 'alert-message warning';
+			consentStatus.textContent = confirm.checked ? ' ' + _('Confirmed for this draft. Save switching settings to apply.') : '';
+		}
+
 		function updateControls() {
 			var enabled = mode.value !== 'off';
 			fields.hidden = candidateFields.hidden = !selected;
@@ -274,9 +284,9 @@ return view.extend({
 			options.hidden = !enabled;
 			windowRow.hidden = failureMethod.value !== 'window';
 			schedule.hidden = mode.value !== 'scheduled';
-			confirmation.hidden = !enabled || !canWrite;
+			updateConsent();
 			save.hidden = !canWrite;
-			save.disabled = busy || !context || !selected || (enabled && !context.can_switch);
+			save.disabled = busy || !context || !selected || !dirty.has(selected) || (enabled && !context.can_switch);
 			refresh.disabled = busy;
 			showSavedMode();
 			showTiming();
@@ -317,7 +327,6 @@ return view.extend({
 					draft().candidates = Array.from(chosen);
 					markEdited();
 					showCandidateCount();
-					message('', false);
 					if (missing)
 						showCandidates();
 				});
@@ -352,7 +361,6 @@ return view.extend({
 
 		function showOutbound() {
 			selected = outbound.value;
-			confirm.checked = false;
 			search.value = '';
 			if (selected) {
 				session.setLocalData(outboundKey, selected);
@@ -400,6 +408,7 @@ return view.extend({
 			unverified.forEach(function(policy, name) {
 				if (matchesSaved(policy, saved.get(name))) {
 					dirty.delete(name);
+					restartConsent.delete(name);
 					unverified.delete(name);
 				}
 			});
@@ -464,7 +473,7 @@ return view.extend({
 					message(_('Enter a failure window between 1 and 180 minutes.'), true);
 					return;
 				}
-				if (!confirm.checked) {
+				if (!restartConsent.has(selected)) {
 					message(_('Confirm that automatic switching may interrupt Xray connections.'), true);
 					return;
 				}
@@ -520,23 +529,26 @@ return view.extend({
 			message('', false);
 		});
 		mode.addEventListener('change', function() {
-			confirm.checked = false;
-			markEdited();
+			restartConsent.delete(selected);
 			rememberInputs();
-			updateControls();
-			message('', false);
+			markEdited();
 		});
 		failureMethod.addEventListener('change', function() {
-			markEdited();
 			rememberInputs();
-			updateControls();
+			markEdited();
 		});
 		[failures, failureWindow, cooldown, latency, start, end].forEach(function(input) {
 			input.addEventListener('input', function() {
-				markEdited();
 				rememberInputs();
-				if (input === failures || input === failureWindow) showTiming();
+				markEdited();
 			});
+		});
+		confirm.addEventListener('change', function() {
+			if (confirmation.hidden || busy) return;
+			if (confirm.checked) restartConsent.add(selected);
+			else restartConsent.delete(selected);
+			updateConsent();
+			message('', false);
 		});
 		search.addEventListener('input', showCandidates);
 		removeUnavailable.addEventListener('click', function() {
