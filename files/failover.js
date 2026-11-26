@@ -46,11 +46,14 @@ function rangeInput(id, min, max) {
 }
 
 function newPolicy(outbound, saved) {
-	return Object.assign({
+	var policy = Object.assign({
 		outbound: outbound, mode: 'off', candidates: [], failures: 3,
 		failure_method: 'consecutive', failure_window_minutes: 10,
 		max_ms: 0, cooldown_seconds: 900, start: '', end: ''
 	}, saved || {});
+	policy.outbound = outbound;
+	policy.candidates = policy.candidates.slice();
+	return policy;
 }
 
 function validTime(value) {
@@ -107,6 +110,16 @@ return view.extend({
 		var restartConsent = new Set();
 		var timing = null, timingTarget = null, timingRequests = 0, timingBusy = false;
 		var outbound = E('select', { 'id': 'failover-outbound', 'class': 'cbi-input-select' });
+		var presetSource = E('select', { 'id': 'failover-preset-source', 'class': 'cbi-input-select' });
+		var copyPreset = E('button', {
+			'id': 'failover-copy-preset', 'type': 'button', 'class': 'btn cbi-button cbi-button-neutral'
+		});
+		var presetRow = E('div', { 'class': 'cbi-value' }, [
+			E('label', { 'class': 'cbi-value-title', 'for': presetSource.id }, [_('Copy preset from')]),
+			E('div', { 'class': 'cbi-value-field', 'style': 'display:flex;align-items:center;flex-wrap:wrap;gap:.5em' }, [
+				presetSource, copyPreset
+			])
+		]);
 		var modeLabels = { off: _('Off'), outage: _('On repeated outages'), scheduled: _('During scheduled hours') };
 		var mode = E('select', { 'id': 'failover-mode', 'class': 'cbi-input-select' }, [
 			option('off', modeLabels.off), option('outage', modeLabels.outage), option('scheduled', modeLabels.scheduled)
@@ -276,6 +289,25 @@ return view.extend({
 			consentStatus.textContent = confirm.checked ? ' ' + _('Confirmed for this draft. Save switching settings to apply.') : '';
 		}
 
+		function showPresetSources() {
+			var previous = presetSource.value;
+			presetSource.textContent = '';
+			var choices = Array.from(saved.keys()).filter(function(name) { return name !== selected; });
+			presetSource.appendChild(option('', choices.length ? _('Choose a saved outbound') : _('No other saved presets')));
+			choices.forEach(function(name) {
+				presetSource.appendChild(option(name, name + ' · ' + modeLabels[saved.get(name).mode]));
+			});
+			if (choices.includes(previous)) presetSource.value = previous;
+		}
+
+		function updatePresetControls() {
+			presetRow.hidden = !canWrite || !context || !selected;
+			presetSource.disabled = presetRow.hidden || busy || presetSource.options.length < 2;
+			copyPreset.disabled = presetSource.disabled || !presetSource.value ||
+				presetSource.value === selected || !saved.has(presetSource.value);
+			copyPreset.textContent = dirty.has(selected) ? _('Replace draft') : _('Copy to draft');
+		}
+
 		function updateControls() {
 			var enabled = mode.value !== 'off';
 			fields.hidden = candidateFields.hidden = !selected;
@@ -290,6 +322,7 @@ return view.extend({
 			refresh.disabled = busy;
 			showSavedMode();
 			showTiming();
+			updatePresetControls();
 		}
 
 		function rememberInputs() {
@@ -379,6 +412,7 @@ return view.extend({
 				current.textContent = target && target.current || _('No single current server');
 			}
 			showCandidates();
+			showPresetSources();
 			updateControls();
 			refreshTiming();
 		}
@@ -528,6 +562,16 @@ return view.extend({
 			showOutbound();
 			message('', false);
 		});
+		presetSource.addEventListener('change', updatePresetControls);
+		copyPreset.addEventListener('click', function() {
+			if (copyPreset.disabled) return;
+			var source = presetSource.value;
+			drafts.set(selected, newPolicy(selected, saved.get(source)));
+			restartConsent.delete(selected);
+			markEdited();
+			showOutbound();
+			message(_('Copied the saved preset from %s to the draft for %s. Save to apply.').format(source, selected), false);
+		});
 		mode.addEventListener('change', function() {
 			restartConsent.delete(selected);
 			rememberInputs();
@@ -568,7 +612,7 @@ return view.extend({
 			E('h2', {}, [_('Server failover')]),
 			availability,
 			E('form', { 'submit': submit, 'novalidate': '' }, [
-				row(_('Outbound'), outbound), fields,
+				row(_('Outbound'), outbound), presetRow, fields,
 				E('div', { 'class': 'cbi-page-actions' }, [refresh, ' ', save]),
 				status, candidateFields
 			])
