@@ -3,6 +3,8 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
@@ -54,6 +56,16 @@ class LatencyHistory(NodeFixture):
                                         input=json.dumps({"outbound": tag}, ensure_ascii=False),
                                         text=True, timeout=8)
         self.assertEqual(json.loads(reply)["samples"], first)
+        self.assertNotIn("histories", json.loads(reply))
+
+        combined = json.loads(subprocess.check_output([self.binary, "latency-rpc", str(path)],
+                                                      input='{"outbound":""}', text=True, timeout=8))
+        groups = {group["name"]: group for group in json.loads(combined["histories"])}
+        self.assertEqual(set(groups), {tag, other})
+        self.assertEqual(combined["samples"], [])
+        point = groups[tag]["points"][0]
+        self.assertEqual(groups[tag]["tracks"][point[1]], [first[0]["server"], first[0]["series"], 0])
+        self.assertEqual([point[0], *point[2:]], [first[0]["at"], 0, first[0]["ms"]])
 
         self.configure([(tag, 2, secret), (other, 3, "correct")])
         self.wait_for(lambda _: any(sample["server"] == "Profile 2" and
@@ -88,6 +100,36 @@ class LatencyHistory(NodeFixture):
         after_restart = samples()
         for sample in before_restart:
             self.assertIn(sample, after_restart)
+
+
+class PackedLatencyHistory(unittest.TestCase):
+    def test_full_snapshot_fits_in_one_ubus_message(self):
+        now = int(time.time())
+        groups = []
+        for outbound in range(64):
+            tracks = [["\\" * 127 + str(track), '"' * 63 + str(track), 0] for track in range(8)]
+            points = [[now - 256 + i, i % len(tracks), i % 3] + ([60000] if i % 3 == 0 else [])
+                      for i in range(256)]
+            groups.append({"name": f"{outbound:02}" + "\\" * 253, "tracks": tracks, "points": points})
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory, "history.json")
+            path.write_text(json.dumps(groups), encoding="utf-8")
+            result = subprocess.check_output([os.environ["V2RAYA_HELPER"], "latency-rpc", str(path)],
+                                             input='{"outbound":""}', text=True, timeout=8)
+        reply = json.loads(result)
+        self.assertEqual(reply["outbounds"], [group["name"] for group in groups])
+        self.assertEqual(reply["samples"], [])
+        packed = json.loads(reply["histories"])
+        self.assertEqual(sum(len(group["points"]) for group in packed), 16384)
+        for source, output in zip(groups, packed):
+            self.assertEqual(source["name"], output["name"])
+            original = [(p[0], source["tracks"][p[1]], p[2:]) for p in source["points"]]
+            restored = [(p[0], output["tracks"][p[1]], p[2:]) for p in output["points"]]
+            self.assertEqual(original, restored)
+        # Max-size names and packed JSON are strings in the ubus message.
+        # Allow for string/array headers, alignment and fixed message fields.
+        blob_upper_bound = len(reply["histories"].encode()) + 64 * (255 + 16) + 256
+        self.assertLess(blob_upper_bound, 1024 * 1024)
 
 
 class ReserveLatencyHistory(unittest.TestCase):

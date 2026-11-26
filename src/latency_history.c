@@ -457,14 +457,35 @@ static void rpc_point(json_object *samples, const char *server, const char *seri
     json_object_array_add(samples, item);
 }
 
+static void rpc_histories(const char *path, json_object *reply, json_object *outbounds)
+{
+    struct latency_history *h = latency_history_create(path);
+    json_object *groups = json_object_new_array();
+    for (size_t i = 0; h && i < h->count; i++) {
+        struct outbound_history *out = &h->outbounds[i];
+        if (!out->count) continue;
+        json_object_array_add(outbounds, json_object_new_string(out->name));
+        json_object_array_add(groups, encode_group(out));
+    }
+    /* The compact JSON fits the 1 MiB ubus limit even at the history caps.
+     * A blobmsg array would add headers to every timestamp, index and value. */
+    const char *packed = json_object_to_json_string_ext(groups,
+        JSON_C_TO_STRING_PLAIN | JSON_C_TO_STRING_NOSLASHESCAPE);
+    json_object_object_add(reply, "histories", json_object_new_string(packed));
+    json_object_put(groups);
+    latency_history_free(h);
+}
+
 int latency_history_rpc(const char *path, const char *outbound)
 {
-    json_object *doc = read_history(path), *reply = json_object_new_object();
+    int combined = outbound && !*outbound;
+    json_object *doc = combined ? NULL : read_history(path), *reply = json_object_new_object();
     json_object *outbounds = json_object_new_array(), *samples = json_object_new_array();
     time_t now = time(NULL);
     json_object_object_add(reply, "router_unix", json_object_new_int64((int64_t)now));
     json_object_object_add(reply, "outbounds", outbounds);
     json_object_object_add(reply, "samples", samples);
+    if (combined) rpc_histories(path, reply, outbounds);
     int selected_added = 0;
     for (size_t i = 0; doc && i < json_object_array_length(doc); i++) {
         json_object *group = json_object_array_get_idx(doc, i);

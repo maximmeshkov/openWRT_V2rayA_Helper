@@ -12,7 +12,10 @@ var readHistory = rpc.declare({
 	reject: true
 });
 
-var colors = { active: '#3989d7', reserve: '#209875', timeout: '#d77818', error: '#d84d5b' };
+var palette = ['#3388d7', '#238b6c', '#ac620f', '#a958a5', '#698018', '#7964cf', '#bd5670', '#008497'];
+var dashStyles = [[], [7, 3], [2, 3], [8, 2, 2, 2], [12, 4], [4, 4], [10, 2, 4, 2], [3, 2, 3, 5]];
+var colors = { timeout: '#d32f2f', error: '#d84d5b' };
+var states = ['ok', 'timeout', 'error'];
 
 function option(value, label) {
 	return E('option', { 'value': value }, [label]);
@@ -22,15 +25,28 @@ function sampleText(sample) {
 	var role = sample.role === 'reserve' ? _('Reserve') : _('Assigned');
 	var result = sample.state === 'ok' ? sample.ms + ' ' + _('ms') :
 		(sample.state === 'timeout' ? _('Timeout') : _('Error'));
-	return [new Date(sample.at * 1000).toLocaleString(), role, sample.server, result].join(' · ');
+	return [sample.outbound, sample.server, role, result, new Date(sample.at * 1000).toLocaleString()].join(' · ');
 }
 
-function validSample(sample) {
-	return sample && Number.isSafeInteger(sample.at) && sample.at > 0 &&
-		(sample.role === 'active' || sample.role === 'reserve') &&
-		typeof sample.server === 'string' && typeof sample.series === 'string' &&
-		(sample.state === 'timeout' || sample.state === 'error' ||
-			(sample.state === 'ok' && Number.isFinite(sample.ms) && sample.ms >= 0));
+function expandHistory(groups) {
+	var samples = [];
+	groups.forEach(function(group) {
+		if (!group || typeof group.name !== 'string' || !Array.isArray(group.tracks) || !Array.isArray(group.points))
+			return;
+		group.points.forEach(function(point) {
+			if (!Array.isArray(point) || !Number.isSafeInteger(point[0]) || point[0] <= 0 ||
+				!Number.isInteger(point[1]) || !Number.isInteger(point[2]))
+				return;
+			var track = group.tracks[point[1]], state = states[point[2]];
+			if (!Array.isArray(track) || typeof track[0] !== 'string' || typeof track[1] !== 'string' ||
+				(track[2] !== 0 && track[2] !== 1) || !state ||
+				(state === 'ok' && (!Number.isFinite(point[3]) || point[3] < 0)))
+				return;
+			samples.push({ outbound: group.name, at: point[0], server: track[0], series: track[1],
+				role: track[2] === 1 ? 'reserve' : 'active', state: state, ms: point[3] });
+		});
+	});
+	return samples.sort(function(a, b) { return a.at - b.at; });
 }
 
 function scaleStep(maximum) {
@@ -45,19 +61,26 @@ function timeLabel(value, hours) {
 		date.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
 }
 
-function draw(canvas, samples, now, hours) {
+function draw(canvas, samples, now, hours, pens) {
 	var context = canvas.getContext('2d');
 	if (!context)
 		return [];
 
+	var failures = new Map();
+	samples.forEach(function(sample) {
+		if (sample.state !== 'ok' && !failures.has(sample.outbound))
+			failures.set(sample.outbound, failures.size);
+	});
+	var height = 270 + failures.size * 18;
+	canvas.style.height = height + 'px';
 	var box = canvas.getBoundingClientRect();
-	var width = Math.max(280, box.width || 720), height = box.height || 300;
+	var width = Math.max(280, box.width || 720);
 	var pixelRatio = Math.min(window.devicePixelRatio || 1, 3);
 	canvas.width = Math.round(width * pixelRatio);
 	canvas.height = Math.round(height * pixelRatio);
 	context.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0);
 	context.font = '12px sans-serif';
-	var left = 72, right = width - 12, top = 16, bottom = height - 66;
+	var left = width < 520 ? 72 : 112, right = width - 12, top = 16, bottom = 230;
 	var gridColor = window.getComputedStyle(canvas).color;
 	var begin = now - hours * 3600, maximum = 20;
 	samples.forEach(function(sample) {
@@ -91,35 +114,50 @@ function draw(canvas, samples, now, hours) {
 		line(left, y(tick), right, y(tick), gridColor, .16);
 		context.fillText(tick + ' ' + _('ms'), left - 6, y(tick));
 	}
-	var track = bottom + 22;
-	line(left, track, right, track, gridColor, .16);
-	context.fillText(_('Failures'), left - 6, track, left - 9);
+	var firstFailure = bottom + 17;
+	failures.forEach(function(index, name) {
+		var at = firstFailure + index * 18;
+		line(left, at, right, at, gridColor, .16);
+		context.fillStyle = pens.get(name).color;
+		context.fillText(name, left - 6, at, left - 9);
+	});
+	context.fillStyle = gridColor;
 	context.textBaseline = 'top';
 	for (var at = begin; at <= now; at += stepX) {
-		line(x(at), top, x(at), track + 7, gridColor, .13);
+		line(x(at), top, x(at), bottom + failures.size * 18 + 4, gridColor, .13);
 		context.textAlign = at === begin ? 'left' : (at === now ? 'right' : 'center');
 		context.fillText(timeLabel(at, hours), x(at), height - 21);
 	}
 
-	var previousActive = null;
+	var previous = new Map();
 	samples.forEach(function(sample) {
-		var point = { sample: sample, x: x(sample.at), y: sample.state === 'ok' ? y(sample.ms) : track };
+		var point = { sample: sample, x: x(sample.at), y: sample.state === 'ok' ? y(sample.ms) :
+			firstFailure + failures.get(sample.outbound) * 18 };
 		plotted.push(point);
-		if (sample.role === 'active') {
-			if (previousActive && sample.state === 'ok' && previousActive.sample.series === sample.series &&
-				sample.at - previousActive.sample.at <= 300) {
-				context.lineWidth = 1.5;
-				line(previousActive.x, previousActive.y, point.x, point.y, colors.active, 1);
-			}
-			previousActive = sample.state === 'ok' ? point : null;
+		if (sample.role !== 'active')
+			return;
+		if (!previous.has(sample.outbound))
+			previous.set(sample.outbound, new Map());
+		var series = previous.get(sample.outbound), last = series.get(sample.series);
+		if (sample.state !== 'ok') {
+			series.delete(sample.series);
+			return;
 		}
+		if (last && sample.at - last.sample.at <= 300) {
+			var pen = pens.get(sample.outbound);
+			context.lineWidth = 1.6;
+			context.setLineDash(pen.dash);
+			line(last.x, last.y, point.x, point.y, pen.color, 1);
+		}
+		series.set(sample.series, point);
 	});
+	context.setLineDash([]);
 
 	plotted.forEach(function(point) {
 		var state = point.sample.state;
 		var radius = point.sample.role === 'reserve' ? 4 : 2.5;
 		context.lineWidth = 1.5;
-		context.fillStyle = state === 'ok' ? colors[point.sample.role] : colors[state];
+		context.fillStyle = state === 'ok' ? pens.get(point.sample.outbound).color : colors[state];
 		context.strokeStyle = context.fillStyle;
 		context.beginPath();
 		if (state === 'timeout') {
@@ -137,7 +175,10 @@ function draw(canvas, samples, now, hours) {
 			context.stroke();
 		} else {
 			context.arc(point.x, point.y, radius, 0, 2 * Math.PI);
-			context.fill();
+			if (point.sample.role === 'reserve')
+				context.stroke();
+			else
+				context.fill();
 		}
 	});
 	return plotted;
@@ -159,7 +200,11 @@ return view.extend({
 	},
 
 	render: function(initial) {
-		var outbound = E('select', { 'id': 'v2raya-latency-outbound', 'class': 'cbi-input-select' });
+		var all = E('input', { 'type': 'checkbox' });
+		var choices = E('div', { 'style': 'display:flex;gap:.4em 1em;flex-wrap:wrap' });
+		var outboundsField = E('fieldset', { 'style': 'border:0;padding:0;margin:.75em 0 0;min-width:0' }, [
+			E('legend', {}, [_('Outbounds')]), E('label', {}, [all, ' ', _('All outbounds')]), choices
+		]);
 		var range = E('select', { 'id': 'v2raya-latency-range', 'class': 'cbi-input-select' }, [
 			option('1', _('Last hour')), option('6', _('Last 6 hours')), option('24', _('Last 24 hours'))
 		]);
@@ -170,83 +215,118 @@ return view.extend({
 		var status = E('p', { 'role': 'status' });
 		var detail = E('p', { 'style': 'min-height:1.5em;overflow-wrap:anywhere', 'aria-live': 'polite' });
 		var heading = E('div', { 'style': 'display:flex;gap:1em;flex-wrap:wrap;align-items:center' }, [
-			E('label', { 'for': outbound.id }, [_('Outbound')]), outbound,
 			E('label', { 'for': range.id }, [_('Time range')]), range
 		]);
 		var graph = E('figure', { 'style': 'margin:1em 0 0' }, [canvas, E('figcaption', {}, [
-			legendItem('━', colors.active, _('Assigned server')),
-			legendItem('●', colors.reserve, _('Reserve check')),
+			legendItem('━', 'currentColor', _('Assigned server')),
+			legendItem('○', 'currentColor', _('Reserve check')),
 			legendItem('◆', colors.timeout, _('Timeout')),
 			legendItem('×', colors.error, _('Error'))
 		]), detail]);
-		var root = E('div', {}, [E('h2', {}, [_('HTTPS latency')]), heading, status, graph]);
+		var root = E('div', {}, [E('h2', {}, [_('HTTPS latency')]), heading, outboundsField, status, graph]);
 		var outbounds = [], history = [], points = [], now = 0;
-		var requestId = 0, busy = false, selectedPoint = -1, visiblePoints = [];
+		var busy = false, loadProblem = false, selectedPoint = -1;
+		var hidden = new Set(), pens = new Map(), boxes = new Map();
+
+		function updateSelection() {
+			var selected = 0;
+			boxes.forEach(function(box, name) {
+				box.checked = !hidden.has(name);
+				if (box.checked) selected++;
+			});
+			all.disabled = !outbounds.length;
+			all.checked = !!selected && selected === outbounds.length;
+			all.indeterminate = !!selected && selected < outbounds.length;
+		}
 
 		function updateList(list) {
-			if (!Array.isArray(list)) return;
 			var names = Array.from(new Set(list.filter(function(name) { return typeof name === 'string' && name; })));
-			if (names.join('\n') === outbounds.join('\n') && outbound.options.length) return;
-			var selected = outbound.value;
+			if (names.length === outbounds.length && names.every(function(name, index) { return name === outbounds[index]; }))
+				return;
 			outbounds = names;
-			dom.content(outbound, names.length ? names.map(function(name) { return option(name, name); }) :
-				[option('', _('No outbounds'))]);
-			outbound.disabled = !names.length;
-			outbound.value = names.includes(selected) ? selected : (names[0] || '');
+			boxes.clear();
+			dom.content(choices, names.map(function(name) {
+				if (!pens.has(name)) {
+					var index = pens.size;
+					pens.set(name, { color: palette[index % palette.length],
+						dash: dashStyles[Math.floor(index / palette.length) % dashStyles.length] });
+				}
+				var pen = pens.get(name);
+				var box = E('input', { 'type': 'checkbox' });
+				boxes.set(name, box);
+				box.addEventListener('change', function() {
+					if (box.checked) hidden.delete(name);
+					else hidden.add(name);
+					updateSelection();
+					redraw();
+				});
+				return E('label', { 'style': 'display:inline-flex;gap:.35em;align-items:center;overflow-wrap:anywhere' }, [
+					box, E('span', { 'aria-hidden': 'true', 'style': 'color:' + pen.color }, [pen.dash.length ? '┄' : '━']), name
+				]);
+			}));
+			updateSelection();
 		}
 
 		function review(index) {
 			selectedPoint = index;
 			var sample = points[index] && points[index].sample;
 			detail.textContent = sample ? sampleText(sample) :
-				(visiblePoints.length ? _('Latest check') + ' · ' + sampleText(visiblePoints[visiblePoints.length - 1]) : '');
+				(points.length ? _('Latest check') + ' · ' + sampleText(points[points.length - 1].sample) : '');
 		}
 
 		function redraw() {
-			var from = now - Number(range.value) * 3600;
-			visiblePoints = history.filter(function(sample) { return sample.at >= from && sample.at <= now; });
-			graph.hidden = !visiblePoints.length;
-			if (visiblePoints.length)
-				points = draw(canvas, visiblePoints, now, Number(range.value));
-			else
-				points = [];
+			var hours = Number(range.value), from = now - hours * 3600;
+			var visible = history.filter(function(sample) {
+				return boxes.has(sample.outbound) && !hidden.has(sample.outbound) && sample.at >= from && sample.at <= now;
+			});
+			graph.hidden = !visible.length;
+			points = visible.length ? draw(canvas, visible, now, hours, pens) : [];
 			review(-1);
+			if (loadProblem)
+				status.textContent = visible.length ? _('Unable to refresh the chart. Showing earlier checks.') :
+					_('Unable to load latency history.');
+			else if (!outbounds.length)
+				status.textContent = _('No outbounds with recorded checks.');
+			else if (!outbounds.some(function(name) { return !hidden.has(name); }))
+				status.textContent = _('Select an outbound to show its checks.');
+			else
+				status.textContent = visible.length ? '' : _('No HTTPS checks in this time range.');
 		}
 
-		function refresh(force) {
-			if (busy && force !== true) return Promise.resolve();
-			var requested = outbound.value, id = ++requestId;
+		function receive(reply) {
+			if (!reply || !Array.isArray(reply.outbounds) || !Number.isSafeInteger(reply.router_unix) || reply.router_unix <= 0)
+				throw new Error();
+			var groups = typeof reply.histories === 'string' ? JSON.parse(reply.histories) : reply.histories;
+			if (!Array.isArray(groups)) throw new Error();
+			history = expandHistory(groups);
+			updateList(reply.outbounds);
+			now = reply.router_unix;
+			loadProblem = false;
+			redraw();
+		}
+
+		function showLoadProblem() {
+			loadProblem = true;
+			redraw();
+		}
+
+		function refresh() {
+			if (busy) return Promise.resolve();
 			busy = true;
-			return readHistory(requested).then(function(reply) {
-				if (id !== requestId) return;
+			return readHistory('').then(receive).catch(showLoadProblem).finally(function() {
 				busy = false;
-				if (!reply || !Array.isArray(reply.samples) || !Number.isSafeInteger(reply.router_unix) || reply.router_unix <= 0)
-					throw new Error();
-				updateList(reply.outbounds);
-				if (outbound.value !== requested) return refresh(true);
-				now = reply.router_unix;
-				history = reply.samples.filter(validSample).sort(function(a, b) { return a.at - b.at; });
-				redraw();
-				status.textContent = visiblePoints.length ? '' :
-					(requested ? _('No HTTPS checks in this time range.') : _('No outbounds available.'));
-			}).catch(function() {
-				if (id !== requestId) return;
-				busy = false;
-				status.textContent = history.length ? _('Unable to refresh the chart. Showing earlier checks.') :
-					_('Unable to load latency history.');
 			});
 		}
 
-		outbound.addEventListener('change', function() {
-			history = [];
+		all.addEventListener('change', function() {
+			outbounds.forEach(function(name) {
+				if (all.checked) hidden.delete(name);
+				else hidden.add(name);
+			});
+			updateSelection();
 			redraw();
-			status.textContent = _('Loading latency history…');
-			refresh(true);
 		});
-		range.addEventListener('change', function() {
-			redraw();
-			status.textContent = visiblePoints.length ? '' : _('No HTTPS checks in this time range.');
-		});
+		range.addEventListener('change', redraw);
 		canvas.addEventListener('pointermove', function(event) {
 			var box = canvas.getBoundingClientRect(), closest = -1, distance = 16 * 16;
 			points.forEach(function(point, index) {
@@ -264,19 +344,21 @@ return view.extend({
 			review(Math.max(0, Math.min(index, points.length - 1)));
 		});
 
-		updateList(initial && initial.outbounds);
-		status.textContent = _('Loading latency history…');
-		graph.hidden = true;
+		updateSelection();
+		try {
+			receive(initial);
+		} catch (error) {
+			showLoadProblem();
+		}
 		var resize = typeof ResizeObserver === 'function' ? new ResizeObserver(redraw) : null;
 		if (resize) resize.observe(canvas);
-		refresh(true);
 		function pollHistory() {
 			if (root.isConnected === false) {
 				if (resize) resize.disconnect();
 				poll.remove(pollHistory);
 				return Promise.resolve();
 			}
-			return refresh(false);
+			return refresh();
 		}
 		poll.add(pollHistory, 15);
 		return root;

@@ -17,7 +17,8 @@ void latency_history_add(struct latency_history *history, const char *outbound,
                          const struct measurement *sample, const char *role);
 int latency_history_publish(struct latency_history *history, time_t now);
 
-/* Emit the available outbound names and one optional series of samples. */
+/* NULL lists names, an outbound returns its samples, and an empty string
+ * returns compact histories for all outbounds in the same snapshot. */
 int latency_history_rpc(const char *path, const char *outbound);
 
 #endif
