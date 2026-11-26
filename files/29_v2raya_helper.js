@@ -18,6 +18,8 @@ function reading(result, route) {
 	var label;
 	var style;
 	var active = route && result.source === 'node_https';
+	var activeTimeout = active && (result.state === 'timeout' ||
+		(result.state === 'error' && result.detail === 'https_timeout'));
 	var http = active && Number.isInteger(result.http_code) &&
 		result.http_code >= 100 && result.http_code <= 599;
 	var title = result.detail || '';
@@ -33,26 +35,26 @@ function reading(result, route) {
 		else if (result.detail === 'local_quic') label = _('Local QUIC response');
 		else if (result.detail === 'quic') label = _('QUIC response');
 		else label = _('TCP connected');
-		style = 'success';
+		style = active && Number.isFinite(result.ms) && result.ms > 500 ? 'warning' : 'success';
 		break;
 	case 'failed':      label = _('Request failed'); style = 'danger'; break;
-	case 'timeout':     label = _('Timed out'); style = 'warning'; break;
+	case 'timeout':     label = _('Timed out'); style = activeTimeout ? 'danger' : 'warning'; break;
 	case 'refused':     label = _('Connection refused'); style = 'danger'; break;
 	case 'error':
-		if (http) label = 'HTTP ' + result.http_code;
+		if (activeTimeout) label = _('Timed out');
+		else if (http) label = 'HTTP ' + result.http_code;
 		else if (active && result.detail === 'https_tls_error') label = _('TLS error');
-		else if (active && result.detail === 'https_timeout') label = _('Timed out');
 		else if (active && result.detail === 'https_proxy_error') label = _('Proxy connection failed');
 		else if (active && result.detail === 'xhttp_session_failed') label = _('XHTTP connection failed');
 		else if (active && result.detail === 'https_connect_error') label = _('Connection failed');
 		else label = _('Probe error');
-		style = 'warning';
+		style = activeTimeout ? 'danger' : 'warning';
 		break;
 	case 'unsupported': label = _('Unsupported probe'); break;
 	case 'pending':     label = _('Checking…'); break;
 	default:            label = _('No measurement'); break;
 	}
-	if ((result.state === 'ok' || (http && result.state === 'error')) && Number.isFinite(result.ms))
+	if ((result.state === 'ok' || (http && result.state === 'error' && !activeTimeout)) && Number.isFinite(result.ms))
 		label += ' · ' + result.ms + ' ' + _('ms');
 	return E('span', { 'class': style ? 'label ' + style : '', 'title': title }, [label]);
 }

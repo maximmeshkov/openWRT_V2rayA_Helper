@@ -1,5 +1,6 @@
 #define _POSIX_C_SOURCE 200809L
 #include "failover_policy.h"
+#include "utf8.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <stdint.h>
@@ -87,6 +88,8 @@ int failover_policy_parse(json_object *entry, struct failover_policy *policy)
         .candidates = json_object_object_get(entry, "candidates"),
         .failures = FAILOVER_DEFAULT_FAILURES,
         .cooldown_seconds = FAILOVER_DEFAULT_COOLDOWN,
+        .failure_method = FAILOVER_CONSECUTIVE,
+        .failure_window_minutes = FAILOVER_DEFAULT_WINDOW_MINUTES,
     };
     const char *mode = field(entry, "mode");
     if (!mode || !valid_outbound(policy->outbound) || !checked_candidates(policy->candidates))
@@ -96,7 +99,15 @@ int failover_policy_parse(json_object *entry, struct failover_policy *policy)
     else if (!strcmp(mode, "scheduled")) policy->mode = FAILOVER_SCHEDULED;
     else return -1;
 
-    if (!number(entry, "failures", &policy->failures, FAILOVER_DEFAULT_FAILURES, 30) ||
+    json_object *method;
+    if (json_object_object_get_ex(entry, "failure_method", &method)) {
+        const char *name = read_string(method);
+        if (!name) return -1;
+        if (!strcmp(name, "window")) policy->failure_method = FAILOVER_WINDOW;
+        else if (strcmp(name, "consecutive")) return -1;
+    }
+    if (!number(entry, "failures", &policy->failures, FAILOVER_DEFAULT_FAILURES, FAILOVER_MAX_FAILURES) ||
+        !number(entry, "failure_window_minutes", &policy->failure_window_minutes, 1, 180) ||
         !number(entry, "max_ms", &policy->max_ms, 0, 60000) ||
         !number(entry, "cooldown_seconds", &policy->cooldown_seconds, 60, 86400))
         return -1;
@@ -140,14 +151,7 @@ static json_object *read_fd(int fd)
         if (!n) break;
         used += (size_t)n;
     }
-    if (used == length) {
-        json_tokener *tok = json_tokener_new();
-        if (tok) {
-            json_tokener_set_flags(tok, JSON_TOKENER_STRICT | JSON_TOKENER_VALIDATE_UTF8);
-            settings = json_tokener_parse_ex(tok, buf, (int)length);
-            json_tokener_free(tok);
-        }
-    }
+    if (used == length) settings = parse_utf8_json(buf, length);
     if (!valid_settings(settings)) {
         json_object_put(settings);
         settings = NULL;
@@ -205,6 +209,30 @@ static int fresh(const struct failover_sample *sample, time_t now, long age)
            difftime(now, sample->checked) <= age;
 }
 
+static unsigned expired_failures(const struct failover_streak *streak,
+                                 const struct failover_policy *policy, time_t now)
+{
+    unsigned expired = 0;
+    while (expired < streak->window_count &&
+           difftime(now, streak->failure_times[expired]) > policy->failure_window_minutes * 60u)
+        expired++;
+    return expired;
+}
+
+static void record_window_failure(struct failover_streak *streak,
+                                  const struct failover_policy *policy, time_t at, time_t now)
+{
+    unsigned discard = expired_failures(streak, policy, now);
+    if (!discard && streak->window_count == FAILOVER_MAX_FAILURES) discard = 1;
+    if (discard) {
+        streak->window_count -= discard;
+        memmove(streak->failure_times, streak->failure_times + discard,
+                streak->window_count * sizeof(*streak->failure_times));
+    }
+    if (difftime(now, at) <= policy->failure_window_minutes * 60u)
+        streak->failure_times[streak->window_count++] = at;
+}
+
 void failover_record(struct failover_streak *streak, const struct failover_policy *policy,
                      const struct failover_sample *active, time_t now, long maximum_age)
 {
@@ -214,14 +242,18 @@ void failover_record(struct failover_streak *streak, const struct failover_polic
         *streak = (struct failover_streak){0};
         return;
     }
-    if (policy->mode == FAILOVER_OFF || strcmp(streak->id, active->id) ||
-        (streak->checked && difftime(active->checked, streak->checked) > maximum_age))
+    if (policy->mode == FAILOVER_OFF || strcmp(streak->id, active->id) || streak->checked > now)
         *streak = (struct failover_streak){0};
     if (policy->mode == FAILOVER_OFF || active->checked <= streak->checked) return;
+    if (streak->checked && difftime(active->checked, streak->checked) > maximum_age)
+        streak->failed = streak->slow = 0;
     memcpy(streak->id, active->id, strlen(active->id) + 1);
     streak->checked = active->checked;
+    streak->latest = active->state;
     if (active->state == FAILOVER_FAILED) {
         if (streak->failed < policy->failures) streak->failed++;
+        if (policy->failure_method == FAILOVER_WINDOW)
+            record_window_failure(streak, policy, active->checked, now);
         streak->slow = 0;
         return;
     }
@@ -257,12 +289,14 @@ int failover_policy_ready(const struct failover_policy *policy,
     if (!policy || !streak || policy->mode == FAILOVER_OFF ||
         !json_object_array_length(policy->candidates) ||
         !fresh(active, now, maximum_age) || !valid_id(active->id) ||
-        strcmp(active->id, streak->id) || active->checked != streak->checked ||
+        strcmp(active->id, streak->id) || active->checked != streak->checked || active->state != streak->latest ||
         (last_switch && difftime(now, last_switch) < policy->cooldown_seconds) ||
         (policy->mode == FAILOVER_SCHEDULED && !window_open(policy, now)))
         return 0;
 
-    int failed = active->state == FAILOVER_FAILED && streak->failed >= policy->failures;
+    unsigned failures = policy->failure_method == FAILOVER_WINDOW ?
+        streak->window_count - expired_failures(streak, policy, now) : streak->failed;
+    int failed = active->state == FAILOVER_FAILED && failures >= policy->failures;
     int slow = policy->mode == FAILOVER_SCHEDULED && policy->max_ms &&
         active->state == FAILOVER_OK && active->ms > (long)policy->max_ms &&
         streak->slow >= policy->failures;

@@ -13,7 +13,8 @@ import unittest
 class Policy(C.Structure):
     _fields_ = [("mode", C.c_int), ("failures", C.c_uint), ("max_ms", C.c_uint),
                 ("cooldown", C.c_uint), ("start", C.c_uint), ("end", C.c_uint),
-                ("outbound", C.c_char_p), ("candidates", C.c_void_p)]
+                ("outbound", C.c_char_p), ("candidates", C.c_void_p),
+                ("failure_method", C.c_int), ("failure_window_minutes", C.c_uint)]
 
 
 class Sample(C.Structure):
@@ -23,11 +24,13 @@ class Sample(C.Structure):
 
 class Streak(C.Structure):
     _fields_ = [("id", C.c_char * 97), ("checked", C.c_long),
-                ("failed", C.c_uint), ("slow", C.c_uint)]
+                ("failed", C.c_uint), ("slow", C.c_uint), ("latest", C.c_int),
+                ("window_count", C.c_uint), ("failure_times", C.c_long * 30)]
 
 
 NOW = 1735689600
 UNKNOWN, OK, FAILED = range(3)
+CONSECUTIVE, WINDOW = range(2)
 
 
 class FailoverPolicyTest(unittest.TestCase):
@@ -108,6 +111,7 @@ class FailoverPolicyTest(unittest.TestCase):
     def test_failure_requires_distinct_confirmed_samples_and_viable_candidate(self):
         p = self.policy()
         self.assertEqual((p.failures, p.cooldown), (3, 900))
+        self.assertEqual((p.failure_method, p.failure_window_minutes), (CONSECUTIVE, 10))
         streak = Streak()
         failure = Sample(b"main", FAILED, 0, NOW - 60)
         for _ in range(3):
@@ -129,6 +133,49 @@ class FailoverPolicyTest(unittest.TestCase):
         self.record(p, streak, Sample(b"new-main", FAILED, 0, NOW))
         self.assertEqual(streak.failed, 1)
 
+    def test_rolling_window_counts_distinct_failures_with_recoveries(self):
+        p = self.policy(failure_method="window", failure_window_minutes=3)
+        self.assertEqual((p.failure_method, p.failure_window_minutes), (WINDOW, 3))
+        streak = Streak()
+        for offset, state in [(-120, FAILED), (-90, OK), (-60, FAILED), (-30, OK), (0, FAILED)]:
+            sample = Sample(b"main", state, 0, NOW + offset)
+            self.record(p, streak, sample, NOW + offset)
+            self.record(p, streak, sample, NOW + offset)
+        self.assertEqual(streak.window_count, 3)
+        self.assertEqual(streak.failed, 1)
+        self.assertTrue(self.ready(p, streak, sample))
+        self.assertFalse(self.ready(p, streak, sample, now=NOW + 61))
+
+        recovered = Sample(b"main", OK, 30, NOW + 1)
+        self.record(p, streak, recovered, NOW + 1)
+        self.assertEqual(streak.window_count, 3)
+        self.assertFalse(self.ready(p, streak, recovered, now=NOW + 1))
+        self.assertFalse(self.ready(p, streak, sample, now=NOW + 1))
+        unknown = Sample(b"main", UNKNOWN, 0, NOW + 2)
+        self.record(p, streak, unknown, NOW + 2)
+        self.assertFalse(self.ready(p, streak, unknown, now=NOW + 2))
+        changed = Sample(b"new-main", FAILED, 0, NOW + 3)
+        self.record(p, streak, changed, NOW + 3)
+        self.assertFalse(self.ready(p, streak, changed, now=NOW + 3))
+
+    def test_scheduled_rolling_window_keeps_only_the_latest_thirty_failures(self):
+        p = self.policy(mode="scheduled", start="23:58", end="00:01", failures=30,
+                        failure_method="window", failure_window_minutes=1)
+        streak = Streak()
+        for offset in range(-39, 1):
+            sample = Sample(b"main", FAILED, 0, NOW + offset)
+            self.record(p, streak, sample, NOW + offset)
+        self.assertEqual(streak.window_count, 30)
+        self.assertEqual(streak.failure_times[0], NOW - 29)
+        self.assertTrue(self.ready(p, streak, sample, now=NOW + 31))
+        self.assertFalse(self.ready(p, streak, sample, now=NOW + 32))
+
+        for offset in range(30, 60):
+            sample = Sample(b"main", FAILED, 0, NOW + offset)
+            self.record(p, streak, sample, NOW + offset)
+        self.assertTrue(self.ready(p, streak, sample, now=NOW + 59))
+        self.assertFalse(self.ready(p, streak, sample, now=NOW + 60))
+
     def test_scheduled_slow_threshold_requires_improving_candidate_and_window(self):
         p = self.policy(mode="scheduled", start="23:00", end="06:00", max_ms=300)
         streak, active = self.streak(p, OK, 420)
@@ -146,7 +193,10 @@ class FailoverPolicyTest(unittest.TestCase):
         self.assertFalse(self.ready(p, streak, active))
 
     def test_settings_reject_invalid_policies_and_keep_prior_file(self):
-        for overrides in ({"mode": "reboot"}, {"failures": 1}, {"candidates": ["same", "same"]},
+        for overrides in ({"mode": "reboot"}, {"failures": 1}, {"failures": 31},
+                          {"failure_method": "sliding"}, {"failure_method": None},
+                          {"failure_window_minutes": 0}, {"failure_window_minutes": 181},
+                          {"failure_window_minutes": "10"}, {"candidates": ["same", "same"]},
                           {"mode": "scheduled", "start": "24:00", "end": "06:00"},
                           {"mode": "scheduled", "start": "05:00", "end": "05:00"}):
             with self.subTest(overrides=overrides):
@@ -160,11 +210,16 @@ class FailoverPolicyTest(unittest.TestCase):
             empty = self.lib.failover_settings_read(path)
             self.assertTrue(empty)
             self.jsonc.json_object_put(empty)
-            good = {"policies": [{"outbound": "media", "mode": "off", "candidates": []}]}
+            good = {"policies": [{"outbound": "Медиа", "mode": "off", "candidates": []}]}
             self.assertEqual(self.lib.failover_settings_write(path, self.json(good)), 0)
             self.assertEqual(json.loads(settings.read_text()), good)
             self.assertEqual(settings.stat().st_mode & 0o777, 0o600)
+            round_trip = self.lib.failover_settings_read(path)
+            self.assertTrue(round_trip)
+            self.jsonc.json_object_put(round_trip)
             self.assertEqual(self.lib.failover_settings_write(path, self.json({"policies": good["policies"] * 2})), -1)
             self.assertEqual(json.loads(settings.read_text()), good)
+            settings.write_bytes(b'{"policies":[{"outbound":"\xc0\xaf","mode":"off","candidates":[]}]}')
+            self.assertFalse(self.lib.failover_settings_read(path))
             settings.write_text("{")
             self.assertFalse(self.lib.failover_settings_read(path))

@@ -36,10 +36,11 @@ run_helper() {
 
 case "$1" in
 	list)
-		printf '%s\n' '{"status":{},"routing_context":{},"routing_preview":{"kind":"","value":"","outbound":"","before_line":0,"revision":""},"routing_save":{"kind":"","value":"","outbound":"","before_line":0,"revision":""},"failover_context":{},"failover_save":{"policy":{}}}'
+		printf '%s\n' '{"status":{},"latency":{"outbound":""},"routing_context":{},"routing_preview":{"kind":"","value":"","outbound":"","before_line":0,"revision":""},"routing_save":{"kind":"","value":"","outbound":"","before_line":0,"revision":""},"failover_context":{},"failover_save":{"policy":{}}}'
 		;;
 	call)
 		case "$2" in
+			latency) exec /usr/bin/v2raya-helper latency-rpc /var/run/v2raya-helper/latency.json ;;
 			routing_context) run_helper routing context ;;
 			routing_preview) run_helper routing preview ;;
 			routing_save) run_helper routing save ;;

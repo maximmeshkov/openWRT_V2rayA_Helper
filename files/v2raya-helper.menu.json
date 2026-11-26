@@ -15,5 +15,11 @@
 		"order": 20,
 		"action": { "type": "view", "path": "v2raya-helper/failover" },
 		"depends": { "acl": [ "v2raya-helper-failover" ] }
+	},
+	"admin/services/v2raya-helper/latency": {
+		"title": "Latency",
+		"order": 30,
+		"action": { "type": "view", "path": "v2raya-helper/latency" },
+		"depends": { "acl": [ "v2raya-helper" ] }
 	}
 }

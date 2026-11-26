@@ -1,9 +1,9 @@
 {
 	"v2raya-helper": {
-		"description": "Read v2rayA outbound monitoring results",
+		"description": "Read v2rayA status and latency history",
 		"read": {
 			"ubus": {
-				"v2raya-helper": [ "status" ]
+				"v2raya-helper": [ "status", "latency" ]
 			}
 		}
 	},

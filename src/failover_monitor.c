@@ -4,6 +4,7 @@
 #include "failover_policy.h"
 #include "failover_profile.h"
 #include "node_profile.h"
+#include "latency_history.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
@@ -27,6 +28,7 @@ struct failover_monitor {
     char *lock_path, *last_path;
     struct v2raya_api api;
     struct https_options https;
+    struct latency_history *history;
     uint32_t mark;
     json_object *settings;
     struct status *rows;
@@ -44,7 +46,7 @@ int failover_lock_settings(const char *path)
 }
 
 struct failover_monitor *failover_monitor_create(const char *path, const struct v2raya_api *api,
-    const struct https_options *https, uint32_t mark)
+    const struct https_options *https, uint32_t mark, struct latency_history *history)
 {
     if (!path || !https->url) return NULL;
     struct failover_monitor *m = calloc(1, sizeof(*m));
@@ -52,6 +54,7 @@ struct failover_monitor *failover_monitor_create(const char *path, const struct 
     m->path = path;
     m->api = *api;
     m->https = *https;
+    m->history = history;
     m->mark = mark;
     if (asprintf(&m->lock_path, "%s.lock", path) < 0 ||
         asprintf(&m->last_path, "%s.last", path) < 0) {
@@ -157,36 +160,43 @@ static enum failover_probe_state classify(const struct measurement *sample, long
     return FAILOVER_UNKNOWN;
 }
 
-static struct failover_sample probe_candidate(struct failover_monitor *m, const char *link)
+static struct failover_sample probe_candidate(struct failover_monitor *m, const struct failover_node *node,
+    const char *outbound, const char *link)
 {
-    struct failover_sample result = {0};
+    struct report {
+        struct measurement sample;
+        long code;
+    } result = {0};
     struct failover_profile profile = {0};
-    if (failover_profile_parse(link, &profile)) return result;
+    if (failover_profile_parse(link, &profile)) return (struct failover_sample){0};
     int channel[2];
     if (pipe2(channel, O_CLOEXEC | O_NONBLOCK) < 0) goto done;
     pid_t parent = getpid(), child = fork();
     if (!child) {
         close(channel[0]);
         if (prctl(PR_SET_PDEATHSIG, SIGKILL) < 0 || getppid() != parent) _exit(1);
-        long code = 0;
-        struct measurement sample = probe_https_profile(&profile.node, &m->https, m->mark, &code);
-        struct failover_sample data = {.state = classify(&sample, code), .ms = sample.ms, .checked = sample.checked};
-        _exit(write(channel[1], &data, sizeof(data)) == sizeof(data) ? 0 : 1);
+        result.sample = probe_https_profile(&profile.node, &m->https, m->mark, &result.code);
+        _exit(write(channel[1], &result, sizeof(result)) == sizeof(result) ? 0 : 1);
     }
     close(channel[1]);
     if (child > 0) {
         struct pollfd ready = {.fd = channel[0], .events = POLLIN};
-        if (poll(&ready, 1, (int)(m->https.timeout * 1000 + 50)) <= 0 ||
-            read(channel[0], &result, sizeof(result)) != sizeof(result)) {
-            result = (struct failover_sample){0};
+        int polled = poll(&ready, 1, (int)(m->https.timeout * 1000 + 50));
+        if (polled <= 0 || read(channel[0], &result, sizeof(result)) != sizeof(result)) {
+            result = (struct report){0};
             kill(child, SIGKILL);
+            if (!polled)
+                result.sample = (struct measurement){.state = "timeout", .detail = "dns_or_probe_timeout",
+                                                     .checked = time(NULL)};
         }
         while (waitpid(child, NULL, 0) < 0 && errno == EINTR) {}
     }
     close(channel[0]);
 done:
     failover_profile_clear(&profile);
-    return result;
+    latency_history_add(m->history, outbound, node->name, node->key, &result.sample, "reserve");
+    return (struct failover_sample){.state = classify(&result.sample, result.code), .ms = result.sample.ms,
+                                    .checked = result.sample.checked};
 }
 
 struct switch_gate {
@@ -236,7 +246,7 @@ static int switch_candidate(struct failover_monitor *m, const struct failover_po
             continue;
         char *link = failover_api_profile(&m->api, candidate, error, sizeof(error));
         if (!link) continue;
-        struct failover_sample result = probe_candidate(m, link);
+        struct failover_sample result = probe_candidate(m, candidate, policy->outbound, link);
         result.id = key;
         int lock = failover_lock_settings(m->lock_path);
         if (lock >= 0) {

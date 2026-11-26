@@ -48,7 +48,8 @@ static const char *store_policy(const char *path, const struct inventory *inv,
     json_object *settings = failover_settings_read(path);
     const char *failure = "Cannot save switching settings";
     if (settings) {
-        const char *const fields[] = {"outbound", "mode", "candidates", "failures",
+        const char *const fields[] = {"outbound", "mode", "candidates", "failures", "failure_method",
+                                     "failure_window_minutes",
                                      "max_ms", "cooldown_seconds", "start", "end"};
         json_object *entry = json_object_new_object();
         json_object *entries = json_object_object_get(settings, "policies");

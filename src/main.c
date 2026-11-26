@@ -3,9 +3,11 @@
 #include "node_profile.h"
 #include "routing_editor.h"
 #include "failover_monitor.h"
+#include "latency_history.h"
 #include <curl/curl.h>
 #include <errno.h>
 #include <getopt.h>
+#include <inttypes.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -162,11 +164,12 @@ static void replace_inventory(struct inventory *old, struct inventory *next, int
 }
 
 static void sync_profiles(struct inventory *inv, const char *path, json_object **config,
-                          struct failover_monitor *failover)
+                          struct failover_monitor *failover, uint64_t *generation)
 {
     json_object *next = node_config_read(path);
     if (!next || !*config || !json_object_equal(*config, next)) {
         failover_monitor_reset(failover);
+        ++*generation;
         for (size_t i = 0; i < inv->count; i++)
             for (size_t j = 0; j < inv->outbounds[i].count; j++) {
                 struct member *m = &inv->outbounds[i].members[j];
@@ -178,6 +181,21 @@ static void sync_profiles(struct inventory *inv, const char *path, json_object *
     }
     json_object_put(*config);
     *config = next;
+}
+
+static void record_latency(struct latency_history *history, const struct inventory *inv, uint64_t generation)
+{
+    if (!history || !inv->running) return;
+    for (size_t i = 0; i < inv->count; i++) {
+        const struct outbound *out = &inv->outbounds[i];
+        for (size_t j = 0; j < out->count; j++) {
+            const struct member *m = &out->members[j];
+            char series[80];
+            snprintf(series, sizeof(series), "%016" PRIx64 ":%" PRId64 ":%" PRId64,
+                     generation, m->subscription, m->node_id);
+            latency_history_add(history, out->name, m->name, series, &m->https, "active");
+        }
+    }
 }
 
 /* Select the oldest due tests so a slow large installation makes progress. */
@@ -232,10 +250,20 @@ int main(int argc, char **argv)
         return routing_editor_command(argc - 2, argv + 2);
     if (argc > 1 && !strcmp(argv[1], "failover"))
         return failover_command(argc - 2, argv + 2);
+    if (argc > 1 && !strcmp(argv[1], "latency"))
+        return argc == 3 || argc == 4 ? latency_history_rpc(argv[2], argc == 4 ? argv[3] : NULL) : 2;
+    if (argc == 3 && !strcmp(argv[1], "latency-rpc")) {
+        json_object *request = read_rpc_json();
+        const char *outbound = rpc_string(request, "outbound");
+        int result = latency_history_rpc(argv[2], outbound);
+        json_object_put(request);
+        return result;
+    }
 
     const char *api = "http://127.0.0.1:2017", *token = NULL, *metrics = NULL;
     const char *output = "/var/run/v2raya-helper/status.json", *xray_config = NULL;
     const char *failover_file = NULL;
+    const char *latency_file = NULL;
     struct https_options https = {.interval = 60, .timeout = 8, .code = 204};
     json_object *profiles = NULL;
     long interval = 10, timeout = 3, workers = 2, route_ttl = 60;
@@ -247,6 +275,7 @@ int main(int argc, char **argv)
         {"xray-config",1,0,'x'},
         {"node-url",1,0,'N'}, {"node-code",1,0,'C'}, {"node-interval",1,0,'A'}, {"node-timeout",1,0,'T'},
         {"failover-file",1,0,'F'},
+        {"latency-file",1,0,'H'},
         {"help",0,0,'h'}, {0,0,0,0}
     };
     int opt;
@@ -267,12 +296,13 @@ int main(int argc, char **argv)
         case 'A': https.interval = number(optarg, 1, 86400); break;
         case 'T': https.timeout = number(optarg, 1, 60); break;
         case 'F': failover_file = optarg; break;
+        case 'H': latency_file = optarg; break;
         case 'h':
             puts("v2raya-helper [--api URL] [--token-file PATH] [--output PATH]\n"
                  "  [--interval SECONDS] [--timeout SECONDS] [--workers 1..16] [--mark N]\n"
                  "  [--observatory LOOPBACK_URL] [--observatory-max-age SECONDS] [--xray-config PATH]\n"
                  "  [--node-url HTTPS_URL --node-code STATUS --node-interval SECONDS --node-timeout SECONDS]\n"
-                 "  [--failover-file PATH]");
+                 "  [--failover-file PATH] [--latency-file PATH]");
             return 0;
         default: return 2;
         }
@@ -291,7 +321,9 @@ int main(int argc, char **argv)
     signal(SIGTERM, stop);
     signal(SIGPIPE, SIG_IGN);
     const struct v2raya_api v2raya = {.base = api, .token_file = token, .timeout_ms = timeout * 1000};
-    struct failover_monitor *failover = failover_monitor_create(failover_file, &v2raya, &https, mark);
+    struct latency_history *history = latency_history_create(latency_file);
+    uint64_t generation = ((uint64_t)probe_clock_ms() << 20) ^ (uint64_t)getpid();
+    struct failover_monitor *failover = failover_monitor_create(failover_file, &v2raya, &https, mark, history);
 
     struct inventory current = {0};
     long ttl = 2 * interval + 6 * timeout + 2;
@@ -305,8 +337,9 @@ int main(int argc, char **argv)
         long wait = interval;
         if (load_inventory(api, token, xray_config, timeout * 1000, &next, err, sizeof(err)) != 0)
             goto unavailable;
+        if (current.running != next.running) ++generation;
         replace_inventory(&current, &next, trusted);
-        if (https.url) sync_profiles(&current, xray_config, &profiles, failover);
+        if (https.url) sync_profiles(&current, xray_config, &profiles, failover, &generation);
         trusted = 1;
         if (publish(output, &current, current.running ? "ok" : "stopped", NULL, ttl, route_ttl, &https)) {
             rc = 1;
@@ -323,8 +356,10 @@ int main(int argc, char **argv)
             read_observatory(metrics, &current, timeout * 1000, route_ttl);
             if (load_inventory(api, token, xray_config, timeout * 1000, &next, err, sizeof(err)) != 0)
                 goto unavailable;
+            if (current.running != next.running) ++generation;
             replace_inventory(&current, &next, 1);
-            if (https.url) sync_profiles(&current, xray_config, &profiles, failover);
+            if (https.url) sync_profiles(&current, xray_config, &profiles, failover, &generation);
+            record_latency(history, &current, generation);
             if (publish(output, &current, current.running ? "ok" : "stopped", NULL, ttl, route_ttl, &https))
                 rc = 1;
             if (backlog) wait = 1;
@@ -332,15 +367,18 @@ int main(int argc, char **argv)
         if (!stopping && !rc) failover_monitor_tick(failover, &current);
         goto sleep_cycle;
 unavailable:
+        if (trusted) ++generation;
         trusted = 0;
         failover_monitor_reset(failover);
         if (publish(output, &current, "stale", err, ttl, route_ttl, &https)) rc = 1;
 sleep_cycle:
+        latency_history_publish(history, time(NULL));
         free_inventory(&next);
         if (!rc && !stopping) sleep((unsigned)wait);
     }
     free_inventory(&current);
     failover_monitor_free(failover);
+    latency_history_free(history);
     json_object_put(profiles);
     curl_global_cleanup();
     return rc;

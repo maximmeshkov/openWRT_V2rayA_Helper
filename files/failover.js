@@ -39,6 +39,7 @@ function rangeInput(id, min, max) {
 function newPolicy(outbound, saved) {
 	return Object.assign({
 		outbound: outbound, mode: 'off', candidates: [], failures: 3,
+		failure_method: 'consecutive', failure_window_minutes: 10,
 		max_ms: 0, cooldown_seconds: 900, start: '', end: ''
 	}, saved || {});
 }
@@ -75,6 +76,17 @@ return view.extend({
 			option('scheduled', _('Inside a time window'))
 		]);
 		var failures = rangeInput('failover-failures', 3, 30);
+		var failureMethod = E('select', { 'id': 'failover-failure-method', 'class': 'cbi-input-select' }, [
+			option('consecutive', _('Consecutive failures')),
+			option('window', _('Failures in a time window'))
+		]);
+		var failureWindow = rangeInput('failover-failure-window', 1, 180);
+		var windowRow = E('div', {}, [
+			row(_('Failure window (minutes)'), failureWindow),
+			E('p', { 'class': 'cbi-section-descr' }, [
+				_('Choose a window long enough to contain the requested number of checks.')
+			])
+		]);
 		var cooldown = rangeInput('failover-cooldown', 60, 86400);
 		var latency = rangeInput('failover-latency', 0, 60000);
 		var start = E('input', { 'id': 'failover-start', 'class': 'cbi-input-text', 'type': 'time' });
@@ -87,7 +99,9 @@ return view.extend({
 		var list = E('div', { 'class': 'cbi-value-field' });
 		var count = E('p');
 		var options = E('div', {}, [
-			row(_('Consecutive checks required'), failures),
+			row(_('How to count failures'), failureMethod),
+			row(_('Failed checks required'), failures),
+			windowRow,
 			row(_('Minimum time between switches (seconds)'), cooldown)
 		]);
 		var schedule = E('div', {}, [
@@ -95,7 +109,7 @@ return view.extend({
 			row(_('Until (router time)'), end),
 			row(_('Latency limit (ms, 0 disables)'), latency),
 			E('p', { 'class': 'cbi-section-descr' }, [
-				_('Switching is allowed inside this window after repeated failed checks or checks over the latency limit.')
+				_('Inside these hours, repeated failures or consecutive checks over the latency limit can trigger a switch.')
 			])
 		]);
 		var confirm = E('input', { 'id': 'failover-confirm', 'type': 'checkbox' });
@@ -130,6 +144,7 @@ return view.extend({
 			fields.disabled = busy || !context || !canWrite;
 			outbound.disabled = busy || !context || context.outbounds.length === 0;
 			options.hidden = !enabled;
+			windowRow.hidden = failureMethod.value !== 'window';
 			schedule.hidden = mode.value !== 'scheduled';
 			confirmation.hidden = !enabled || !canWrite;
 			save.hidden = !canWrite;
@@ -142,6 +157,7 @@ return view.extend({
 				return;
 			Object.assign(draft(), {
 				mode: mode.value, failures: failures.value, cooldown_seconds: cooldown.value,
+				failure_method: failureMethod.value, failure_window_minutes: failureWindow.value,
 				max_ms: latency.value, start: start.value, end: end.value
 			});
 		}
@@ -205,6 +221,8 @@ return view.extend({
 				var policy = draft();
 				mode.value = policy.mode;
 				failures.value = policy.failures;
+				failureMethod.value = policy.failure_method;
+				failureWindow.value = policy.failure_window_minutes;
 				cooldown.value = policy.cooldown_seconds;
 				latency.value = policy.max_ms;
 				start.value = policy.start;
@@ -286,6 +304,10 @@ return view.extend({
 					message(_('Enter 3 to 30 checks and a switch interval of 60 to 86400 seconds.'), true);
 					return;
 				}
+				if (input.failure_method === 'window' && !validInteger(input.failure_window_minutes, 1, 180)) {
+					message(_('Enter a failure window between 1 and 180 minutes.'), true);
+					return;
+				}
 				if (!confirm.checked) {
 					message(_('Confirm that automatic switching may interrupt Xray connections.'), true);
 					return;
@@ -294,6 +316,9 @@ return view.extend({
 			}
 			if (validInteger(input.failures, 3, 30))
 				policy.failures = Number(input.failures);
+			policy.failure_method = input.failure_method;
+			if (validInteger(input.failure_window_minutes, 1, 180))
+				policy.failure_window_minutes = Number(input.failure_window_minutes);
 			if (validInteger(input.cooldown_seconds, 60, 86400))
 				policy.cooldown_seconds = Number(input.cooldown_seconds);
 			if (input.mode === 'scheduled') {
@@ -337,7 +362,13 @@ return view.extend({
 			updateControls();
 			message('', false);
 		});
-		[failures, cooldown, latency, start, end].forEach(function(input) {
+		failureMethod.addEventListener('change', function() {
+			confirm.checked = false;
+			dirty.add(selected);
+			rememberInputs();
+			updateControls();
+		});
+		[failures, failureWindow, cooldown, latency, start, end].forEach(function(input) {
 			input.addEventListener('input', function() {
 				dirty.add(selected);
 				rememberInputs();
