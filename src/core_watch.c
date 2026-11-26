@@ -201,9 +201,11 @@ static int process_info(pid_t pid, struct process_info *info)
     int result = read_proc(pid, "stat", stat, sizeof(stat));
     if (result <= 0) return result;
     char *first = strchr(stat, '('), *last = strrchr(stat, ')');
-    if (!first || !last || last <= first || last[1] != ' ' ||
-        (size_t)(last - first - 1) >= sizeof(info->name)) return -1;
+    if (!first || !last || last <= first || last[1] != ' ') return -1;
     size_t length = (size_t)(last - first - 1);
+    /* procfs expands some kernel worker names. Keep them distinct from the
+     * short, exact v2raya and xray names without failing the entire scan. */
+    if (length >= sizeof(info->name)) length = sizeof(info->name) - 1;
     memcpy(info->name, first + 1, length);
     info->name[length] = '\0';
     char *save = NULL, *field = strtok_r(last + 2, " ", &save);
