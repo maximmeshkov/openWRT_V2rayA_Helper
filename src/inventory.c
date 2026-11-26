@@ -2,6 +2,7 @@
 #include "helper.h"
 #include "node_key.h"
 #include "node_profile.h"
+#include "utf8.h"
 #include "v2raya_api.h"
 
 #include <arpa/inet.h>
@@ -167,6 +168,7 @@ struct api_request {
 	const char *method, *json, *query;
 	int (*permitted)(void *);
 	void *context;
+	int unicode_response;
 };
 
 static json_object *fetch_json_request(const char *url, const char *token, const struct api_request *request,
@@ -255,6 +257,12 @@ static json_object *fetch_json_request(const char *url, const char *token, const
 	if (tok) {
 		json_tokener_set_flags(tok, JSON_TOKENER_STRICT);
 		root = json_tokener_parse_ex(tok, body.bytes, (int)body.len);
+		/* json-c 0.18 strict mode can reject a valid raw UTF-8 character. */
+		size_t end = json_tokener_get_parse_end(tok);
+		if (!root && request && request->unicode_response && end < body.len &&
+		    (unsigned char)body.bytes[end] >= 0x80 &&
+		    json_tokener_get_error(tok) == json_tokener_error_parse_string)
+			root = parse_utf8_json(body.bytes, body.len);
 		json_tokener_free(tok);
 	}
 	if (!root)
@@ -363,9 +371,12 @@ char *v2raya_api_get_version(const struct v2raya_api *api, char *error, size_t l
 	return copy_api_field(v2raya_api_version_data(api, error, len), "version", "version", error, len);
 }
 
+static const struct api_request routing_read = {.unicode_response = 1};
+
 char *v2raya_api_get_routing(const struct v2raya_api *api, char *error, size_t len)
 {
-	return copy_api_field(client_data(api, "routingA", 1, NULL, error, len), "routingA", "routingA", error, len);
+	return copy_api_field(client_data(api, "routingA", 1, &routing_read, error, len),
+	                      "routingA", "routingA", error, len);
 }
 
 json_object *v2raya_api_version_data(const struct v2raya_api *api, char *error, size_t len)
@@ -448,7 +459,7 @@ int v2raya_api_save_routing(const struct v2raya_api *api, const char *expected_o
 		snprintf(error, len, "oversized or unavailable RoutingA payload");
 		goto done;
 	}
-	json_object *data = get_data(api->base, "routingA", token, api->timeout_ms, error, len);
+	json_object *data = request_data(api->base, "routingA", token, &routing_read, api->timeout_ms, error, len);
 	if (!data)
 		goto done;
 	const char *latest = field_text(data, "routingA");

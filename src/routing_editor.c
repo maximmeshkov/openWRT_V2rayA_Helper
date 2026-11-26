@@ -3,6 +3,7 @@
 #include "routing_document.h"
 #include "routing_editor.h"
 #include "routing_validate.h"
+#include "utf8.h"
 #include "v2raya_api.h"
 #include <fcntl.h>
 #include <inttypes.h>
@@ -12,7 +13,8 @@
 #include <sys/file.h>
 #include <unistd.h>
 
-enum { POSITIONS_LIMIT = 400 };
+/* Keep routing_context comfortably below the 1 MiB ubus message limit. */
+enum { POSITIONS_LIMIT = 400, POSITION_LABEL_LIMIT = 2048 };
 
 static void revision(const char *text, char digest[17])
 {
@@ -46,6 +48,27 @@ static void add_outbound(json_object *rows, const char *name, int available)
     json_object_array_add(rows, row);
 }
 
+static json_object *position_label(const struct routing_position *position)
+{
+    const char *text = position->text;
+    size_t length = position->length;
+    if (!valid_utf8(text, length)) return json_object_new_string("");
+    if (length <= POSITION_LABEL_LIMIT) return json_object_new_string_len(text, (int)length);
+
+    static const char omitted[] = " … ";
+    size_t start_length = POSITION_LABEL_LIMIT * 3 / 4;
+    size_t end_start = length - (POSITION_LABEL_LIMIT - start_length - (sizeof(omitted) - 1));
+    while (((unsigned char)text[start_length] & 0xc0) == 0x80) --start_length;
+    while (((unsigned char)text[end_start] & 0xc0) == 0x80) ++end_start;
+
+    char label[POSITION_LABEL_LIMIT];
+    size_t end_label = start_length + sizeof(omitted) - 1;
+    memcpy(label, text, start_length);
+    memcpy(label + start_length, omitted, sizeof(omitted) - 1);
+    memcpy(label + end_label, text + end_start, length - end_start);
+    return json_object_new_string_len(label, (int)(end_label + length - end_start));
+}
+
 static void show_context(json_object *reply, const struct inventory *inv, const char *version,
                          const char *document, const char *digest, int advanced)
 {
@@ -64,11 +87,13 @@ static void show_context(json_object *reply, const struct inventory *inv, const 
     add_outbound(outbounds, "block", 1);
     /* Positions refer to the exact version of the document used for the preview.
      * Only proper routing rules are shown here; definitions may contain credentials. */
-    size_t lines[POSITIONS_LIMIT];
-    size_t count = routing_list_positions(document, lines, POSITIONS_LIMIT);
+    struct routing_position available[POSITIONS_LIMIT];
+    size_t count = routing_list_positions(document, available, POSITIONS_LIMIT);
+    json_object_object_add(reply, "positions_total", json_object_new_int64((int64_t)count));
     for (size_t i = 0; i < count && i < POSITIONS_LIMIT; i++) {
         json_object *row = json_object_new_object();
-        json_object_object_add(row, "line", json_object_new_int64((int64_t)lines[i]));
+        json_object_object_add(row, "line", json_object_new_int64((int64_t)available[i].line));
+        json_object_object_add(row, "label", position_label(&available[i]));
         json_object_array_add(positions, row);
     }
 }

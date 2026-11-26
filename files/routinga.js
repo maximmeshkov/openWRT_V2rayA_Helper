@@ -82,7 +82,31 @@ return view.extend({
 			'required': '', 'autocomplete': 'off', 'spellcheck': 'false', 'maxlength': 2048
 		});
 		var outbound = E('select', { 'id': 'routinga-outbound', 'class': 'cbi-input-select', 'required': '' });
-		var position = E('select', { 'id': 'routinga-position', 'class': 'cbi-input-select' });
+		var positionButton = E('button', {
+			'id': 'routinga-position', 'type': 'button', 'class': 'btn cbi-button cbi-button-neutral',
+			'aria-expanded': 'false', 'aria-controls': 'routinga-position-picker'
+		}, [_('Choose rule…')]);
+		var appendButton = E('button', {
+			'type': 'button', 'class': 'btn cbi-button cbi-button-neutral', 'hidden': ''
+		}, [_('Append instead')]);
+		var placement = E('div', { 'aria-live': 'polite', 'style': 'overflow-wrap:anywhere' });
+		var search = E('input', {
+			'id': 'routinga-position-search', 'type': 'search', 'class': 'cbi-input-text',
+			'aria-label': _('Search existing rules'), 'placeholder': _('Search domain, outbound or line number'),
+			'autocomplete': 'off', 'spellcheck': 'false', 'style': 'width:100%;box-sizing:border-box'
+		});
+		var results = E('ul', { 'id': 'routinga-position-results',
+			'style': 'max-height:14rem;overflow:auto;list-style:none;padding:0;margin:.4em 0' });
+		var count = E('div', { 'role': 'status', 'class': 'cbi-section-descr' });
+		var picker = E('div', {
+			'id': 'routinga-position-picker', 'hidden': '', 'style': 'margin-top:.5em'
+		}, [search, results, count]);
+		var positionControls = E('div', {
+			'style': 'width:100%;max-width:44rem;min-width:0'
+		}, [placement, E('div', { 'style': 'display:flex;flex-wrap:wrap;gap:.4em;margin-top:.4em' }, [
+			positionButton, appendButton
+		]), picker]);
+		var positions = [], positionsTotal = 0, selectedPosition = null;
 		var versionHint = E('p', { 'class': 'cbi-section-descr' });
 		var status = E('p', { 'role': 'status', 'aria-live': 'polite' });
 		var code = E('pre', { 'hidden': '', 'tabindex': '0', 'aria-label': _('Rule preview') });
@@ -93,7 +117,10 @@ return view.extend({
 			formRow(_('Match type'), kind),
 			formRow(_('Address'), address),
 			formRow(_('Outbound'), outbound),
-			formRow(_('Insert rule'), position)
+			E('div', { 'class': 'cbi-value' }, [
+				E('span', { 'class': 'cbi-value-title' }, [_('Insert rule')]),
+				E('div', { 'class': 'cbi-value-field' }, [positionControls])
+			])
 		]);
 
 		function updateControls() {
@@ -115,12 +142,69 @@ return view.extend({
 			code.hidden = true;
 		}
 
+		function showPlacement() {
+			placement.textContent = '';
+			if (selectedPosition) {
+				placement.appendChild(E('span', {}, [
+					_('Before rule'), ' ', E('code', { 'style': 'white-space:pre-wrap' }, [selectedPosition.label]),
+					' ', E('small', {}, [_('Line %d').format(selectedPosition.line)])
+				]));
+			} else {
+				placement.textContent = _('After existing rules');
+			}
+			positionButton.hidden = !positions.length;
+			appendButton.hidden = !selectedPosition;
+		}
+
+		function closePicker() {
+			picker.hidden = true;
+			positionButton.setAttribute('aria-expanded', 'false');
+			search.value = '';
+			results.textContent = '';
+		}
+
+		function choosePosition(item) {
+			selectedPosition = item;
+			closePicker();
+			showPlacement();
+			positionButton.focus();
+			edited();
+		}
+
+		function showMatches() {
+			var query = search.value.trim().toLowerCase();
+			var matches = positions.filter(function(item) {
+				return String(item.line) === query || item.label.toLowerCase().includes(query);
+			});
+			var rows = document.createDocumentFragment();
+			matches.forEach(function(item) {
+				var button = E('button', {
+					'type': 'button', 'class': 'btn cbi-button cbi-button-neutral',
+					'style': 'display:flex;align-items:baseline;gap:.6em;width:100%;box-sizing:border-box;text-align:left;white-space:normal'
+				}, [E('code', { 'style': 'flex:1;min-width:0;white-space:pre-wrap;overflow-wrap:anywhere' }, [item.label]),
+					E('small', { 'style': 'white-space:nowrap' }, [_('Line %d').format(item.line)])]);
+				button.addEventListener('click', function() { choosePosition(item); });
+				rows.appendChild(E('li', { 'style': 'margin:.2em 0' }, [button]));
+			});
+			results.replaceChildren(rows);
+			results.scrollTop = 0;
+			var message = matches.length ? _('Matching rules: %d').format(matches.length) : _('No matching rules.');
+			if (positionsTotal > positions.length)
+				message += ' ' + _('Search covers the first %d of %d rules.').format(positions.length, positionsTotal);
+			count.textContent = message;
+		}
+
 		function populate(reply) {
 			var selected = outbound.value;
 			clearPreview();
+			closePicker();
+			selectedPosition = null;
+			positions = [];
+			positionsTotal = 0;
 			if (!reply || reply.ok !== true || typeof reply.revision !== 'string') {
 				context = null;
 				versionHint.textContent = '';
+				showPlacement();
 				showStatus(responseError(reply, _('Could not load RoutingA from v2rayA.')), true);
 				updateControls();
 				return;
@@ -135,14 +219,11 @@ return view.extend({
 					outbound.value = selected;
 			});
 
-			position.textContent = '';
-			position.appendChild(option('0', _('After existing rules')));
-			(Array.isArray(reply.positions) ? reply.positions : []).forEach(function(item) {
-				if (Number.isInteger(item.line) && item.line > 0) {
-					var label = _('Before line %d').format(item.line);
-					position.appendChild(option(item.line, item.label ? label + ' — ' + item.label : label));
-				}
+			positions = (Array.isArray(reply.positions) ? reply.positions : []).filter(function(item) {
+				return item && Number.isInteger(item.line) && item.line > 0 && typeof item.label === 'string' && item.label;
 			});
+			positionsTotal = Number.isInteger(reply.positions_total) ? reply.positions_total : positions.length;
+			showPlacement();
 			if (!reply.can_save)
 				versionHint.textContent = _('Preview only. Saving without reconfiguring Xray is unverified for v2rayA %s.').format(reply.version || _('unknown'));
 			else if (!canWrite)
@@ -188,7 +269,7 @@ return view.extend({
 					return;
 				}
 				showStatus(_('Preparing preview…'), false);
-				var args = [kind.value, value, outbound.value, Number(position.value), context.revision];
+				var args = [kind.value, value, outbound.value, selectedPosition ? selectedPosition.line : 0, context.revision];
 				var reply = await previewRule.apply(null, args);
 				if (!reply || reply.ok !== true || typeof reply.rule !== 'string' ||
 				    reply.revision !== args[4] || reply.before_line !== args[3]) {
@@ -225,7 +306,31 @@ return view.extend({
 		}
 
 		address.addEventListener('input', edited);
-		[kind, outbound, position].forEach(function(control) { control.addEventListener('change', edited); });
+		[kind, outbound].forEach(function(control) { control.addEventListener('change', edited); });
+		positionButton.addEventListener('click', function() {
+			if (!picker.hidden) {
+				closePicker();
+				return;
+			}
+			picker.hidden = false;
+			positionButton.setAttribute('aria-expanded', 'true');
+			showMatches();
+			search.focus();
+		});
+		appendButton.addEventListener('click', function() { choosePosition(null); });
+		search.addEventListener('input', showMatches);
+		search.addEventListener('keydown', function(event) {
+			if (event.key !== 'Enter' && event.key !== 'ArrowDown') return;
+			event.preventDefault();
+			var match = results.querySelector('button');
+			if (match) match.focus();
+		});
+		picker.addEventListener('keydown', function(event) {
+			if (event.key !== 'Escape') return;
+			event.preventDefault();
+			closePicker();
+			positionButton.focus();
+		});
 		saveButton.addEventListener('click', handleSaveRule);
 		reloadButton.addEventListener('click', function() {
 			return run(async function() {

@@ -166,12 +166,17 @@ static int routing_function(const char *p, size_t length)
     return 0;
 }
 
-/* Locate stand-alone routing statements. A preview can use line numbers
- * without reading back lines such as outbound definitions with credentials. */
+static const char *trim_line_end(const char *start, const char *end)
+{
+    if (start < end && end[-1] == '\r') --end;
+    while (end > start && (end[-1] == ' ' || end[-1] == '\t')) --end;
+    return end;
+}
+
+/* Locate stand-alone routing statements without disclosing definitions. */
 static int routing_line(const char *p, const char *end)
 {
-    if (p < end && end[-1] == '\r') --end;
-    while (end > p && (end[-1] == ' ' || end[-1] == '\t')) --end;
+    end = trim_line_end(p, end);
     for (;;) {
         p = skip_space(p, end);
         const char *name = p;
@@ -216,7 +221,7 @@ int routing_can_insert_before(const char *document, size_t before_line)
     return insert_point(document, before_line) != NULL;
 }
 
-size_t routing_list_positions(const char *document, size_t *lines, size_t capacity)
+size_t routing_list_positions(const char *document, struct routing_position *positions, size_t capacity)
 {
     size_t count = 0, line = 1;
     if (!document) return 0;
@@ -224,7 +229,12 @@ size_t routing_list_positions(const char *document, size_t *lines, size_t capaci
         const char *end = strchr(start, '\n');
         const char *limit = end ? end : start + strlen(start);
         if (routing_line(start, limit)) {
-            if (lines && count < capacity) lines[count] = line;
+            if (positions && count < capacity) {
+                const char *text = skip_space(start, limit);
+                positions[count] = (struct routing_position){
+                    .line = line, .text = text, .length = (size_t)(trim_line_end(text, limit) - text)
+                };
+            }
             ++count;
         }
         if (!end) break;

@@ -12,9 +12,14 @@ const char *routing_build_rule(const char *type, const char *value, const char *
 
 /* before_line = 0 appends. Other values are one-based source line numbers. */
 int routing_can_insert_before(const char *document, size_t before_line);
+struct routing_position {
+    size_t line;
+    const char *text;
+    size_t length;
+};
 /* Fill at most capacity positions. The return value counts all suitable
- * lines so a caller can tell whether it showed a full or partial list. */
-size_t routing_list_positions(const char *document, size_t *lines, size_t capacity);
+ * lines. The trimmed text spans refer to the original document. */
+size_t routing_list_positions(const char *document, struct routing_position *positions, size_t capacity);
 const char *routing_insert_rule(const char *document, const char *rule, size_t before_line,
                                 char **updated);
 

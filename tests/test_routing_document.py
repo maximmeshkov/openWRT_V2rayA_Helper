@@ -7,6 +7,10 @@ import tempfile
 import unittest
 
 
+class RoutingPosition(ctypes.Structure):
+    _fields_ = [("line", ctypes.c_size_t), ("text", ctypes.c_void_p), ("length", ctypes.c_size_t)]
+
+
 @unittest.skipIf(os.environ.get("V2RAYA_TEST_SYSROOT"), "native RoutingA parser tests")
 class RoutingDocumentTest(unittest.TestCase):
     @classmethod
@@ -27,7 +31,7 @@ class RoutingDocumentTest(unittest.TestCase):
         cls.lib.routing_can_insert_before.argtypes = [ctypes.c_char_p, ctypes.c_size_t]
         cls.lib.routing_can_insert_before.restype = ctypes.c_int
         cls.lib.routing_list_positions.argtypes = [
-            ctypes.c_char_p, ctypes.POINTER(ctypes.c_size_t), ctypes.c_size_t]
+            ctypes.c_char_p, ctypes.POINTER(RoutingPosition), ctypes.c_size_t]
         cls.lib.routing_list_positions.restype = ctypes.c_size_t
         cls.lib.routing_insert_rule.argtypes = [ctypes.c_char_p, ctypes.c_char_p,
                                                ctypes.c_size_t, ctypes.POINTER(ctypes.c_void_p)]
@@ -104,11 +108,13 @@ class RoutingDocumentTest(unittest.TestCase):
         rows = source.split(b"\r\n")
         for line in range(1, len(rows) + 1):
             self.assertEqual(bool(self.lib.routing_can_insert_before(source, line)), line in (5, 6))
-        positions = (ctypes.c_size_t * 2)(0, 0)
+        positions = (RoutingPosition * 2)()
         self.assertEqual(self.lib.routing_list_positions(source, positions, 1), 2)
-        self.assertEqual(list(positions), [5, 0])
+        self.assertEqual([position.line for position in positions], [5, 0])
         self.assertEqual(self.lib.routing_list_positions(source, positions, 2), 2)
-        self.assertEqual(list(positions), [5, 6])
+        self.assertEqual([position.line for position in positions], [5, 6])
+        self.assertEqual([ctypes.string_at(position.text, position.length) for position in positions],
+                         [row.strip() for row in rows[4:]])
         self.assertEqual(self.insert(source, rule, 2), ("invalid_insertion_point", None))
         self.assertEqual(self.insert(source, rule, 7), ("invalid_insertion_point", None))
         self.assertEqual(self.insert(source, rule, 5),

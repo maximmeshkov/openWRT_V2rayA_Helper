@@ -41,7 +41,7 @@ class RoutingEditorTest(unittest.TestCase):
 
             def reply(self, status, data=None):
                 response = {"code": "SUCCESS", "data": data} if status == 200 else {"code": "FAIL"}
-                body = json.dumps(response).encode()
+                body = json.dumps(response, ensure_ascii=False).encode()
                 self.send_response(status)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(body)))
@@ -131,7 +131,8 @@ class RoutingEditorTest(unittest.TestCase):
         self.assertEqual({row["name"]: row["available"] for row in context["outbounds"]},
                          {"proxy": True, "media": True, "unassigned": False,
                           "direct": True, "block": True})
-        self.assertEqual([row["line"] for row in context["positions"]], [3])
+        self.assertEqual(context["positions"], [{"line": 3, "label": "domain(domain: internal.example) -> direct"}])
+        self.assertEqual(context["positions_total"], 1)
         request = self.request(before_line=3)
         preview = self.command("preview", request)
         self.assertTrue(preview["ok"], preview)
@@ -142,6 +143,40 @@ class RoutingEditorTest(unittest.TestCase):
         for verb, path, auth in self.requests:
             self.assertEqual(verb, "GET")
             self.assertEqual(auth, None if path.endswith("/version") else "Bearer fixture-routing-token")
+
+    def test_positions_keep_actual_quoted_rules_and_skip_non_rules(self):
+        regex = 'domain(regexp: "[()]#пример") && port(443) -> proxy'
+        ipv6 = 'ip("2001:db8::/32") -> media'
+        self.document = (f"{DOCUMENT}\r\n"
+                         f"\t # {regex}\r\n"
+                         f"  {regex}\t \r\n"
+                         f"\t{ipv6} ")
+        context = self.command("context")
+        self.assertTrue(context["ok"], context)
+        self.assertEqual(context["positions"][1:], [{"line": 6, "label": regex}, {"line": 7, "label": ipv6}])
+        self.assertEqual(context["positions_total"], 3)
+        request = self.request(before_line=6)
+        preview = self.command("preview", request)
+        self.assertTrue(preview["ok"], preview)
+        saved = self.command("save", request)
+        self.assertTrue(saved["ok"], saved)
+        self.assertIn(f'{preview["rule"]}\r\n  {regex}\t \r\n', self.document)
+
+    def test_long_position_labels_preserve_utf8_and_outbound_within_rpc_budget(self):
+        rule = 'domain(regexp: "' + ('ё💡' * 400) + '") -> media'
+        self.document = (rule + "\n") * 401
+        context = self.command("context")
+        self.assertTrue(context["ok"], context)
+        self.assertEqual(context["positions_total"], 401)
+        self.assertEqual(len(context["positions"]), 400)
+        self.assertEqual(context["positions"][-1]["line"], 400)
+        for position in context["positions"]:
+            label = position["label"]
+            self.assertLessEqual(len(label.encode()), 2048)
+            self.assertNotIn("\ufffd", label)
+            self.assertTrue(label.startswith('domain(regexp: "ё💡'))
+            self.assertTrue(label.endswith('") -> media'))
+            self.assertIn(" … ", label)
 
     def test_save_preserves_existing_rules_and_refuses_stale_preview(self):
         request = self.request(before_line=3)
