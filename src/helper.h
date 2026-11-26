@@ -20,6 +20,9 @@ struct member {
     int64_t node_id, subscription;
     int selected;
     struct measurement server;
+    struct measurement https;
+    long http_code;
+    int standard_tls;
 };
 
 struct outbound {
@@ -41,11 +44,25 @@ int load_inventory(const char *api, const char *token_file, const char *xray_con
 void free_inventory(struct inventory *inv);
 json_object *fetch_json(const char *url, const char *token, long timeout_ms,
                         char *error, size_t error_len);
-void probe_members(struct member **jobs, size_t count, long timeout_ms, uint32_t mark);
+struct probe_job {
+    struct outbound *out;
+    struct member *member;
+};
+struct https_options {
+    const char *url;
+    char host[256];
+    int port;
+    long code, interval, timeout;
+};
+void probe_members(struct probe_job *jobs, size_t count, long timeout_ms, uint32_t mark,
+                   const struct https_options *https, json_object *config);
+void probe_node(struct probe_job job, json_object *config, const struct https_options *options,
+                uint32_t mark);
 CURLU *endpoint_url(const char *address);
 int64_t probe_clock_ms(void);
 struct measurement probe_quic(const char *address, long timeout_ms, uint32_t mark);
 void read_observatory(const char *url, struct inventory *inv, long timeout_ms, long max_age);
 int valid_observatory_url(const char *url);
+int https_target(const char *url, char *host, size_t size, int *port);
 
 #endif

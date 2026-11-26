@@ -2,7 +2,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=v2raya-helper
 PKG_VERSION:=0.1.0
-PKG_RELEASE:=5
+PKG_RELEASE:=7
 
 include $(INCLUDE_DIR)/package.mk
 
@@ -50,7 +50,9 @@ endef
 
 define Package/v2raya-helper/postinst
 #!/bin/sh
-[ -n "$${IPKG_INSTROOT}" ] || /etc/init.d/rpcd reload
+if [ -z "$${IPKG_INSTROOT}" ] && ! ubus list v2raya-helper 2>/dev/null | grep -qx v2raya-helper; then
+	/etc/init.d/rpcd reload
+fi
 endef
 
 define Package/luci-app-v2raya-helper/install

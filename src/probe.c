@@ -131,17 +131,22 @@ done:
  * builds. Fork our workers from the main loop and bound the whole batch.
  * Both measurement strings are static literals in the same executable mapping
  * inherited by fork. No child-owned heap pointer travels in the reply. */
-void probe_members(struct member **jobs, size_t count, long timeout_ms, uint32_t mark)
+void probe_members(struct probe_job *jobs, size_t count, long timeout_ms, uint32_t mark,
+                   const struct https_options *https, json_object *config)
 {
-    struct reply { size_t slot; struct measurement sample; };
+    struct reply { size_t slot; struct measurement sample; long code; int standard_tls; };
     int channel[2];
     pid_t workers[16] = {0};
     int received[16] = {0};
     if (!count) return;
-    for (size_t i = 0; i < count; ++i)
-        jobs[i]->server = (struct measurement) {
+    for (size_t i = 0; i < count; ++i) {
+        struct member *m = jobs[i].member;
+        struct measurement *sample = https ? &m->https : &m->server;
+        if (https) { m->http_code = 0; m->standard_tls = 0; }
+        *sample = (struct measurement) {
             .state = "unknown", .detail = "probe_unavailable", .checked = time(NULL)
         };
+    }
     if (pipe2(channel, O_CLOEXEC) < 0) return;
     const pid_t parent = getpid();
     /* Give a worker time to return its specific socket timeout to the parent. */
@@ -151,9 +156,15 @@ void probe_members(struct member **jobs, size_t count, long timeout_ms, uint32_t
         if (pid == 0) {
             close(channel[0]);
             if (prctl(PR_SET_PDEATHSIG, SIGKILL) < 0 || getppid() != parent) _exit(1);
-            struct probe p = {.member = jobs[i], .timeout = timeout_ms, .mark = mark};
-            probe_one(&p);
-            struct reply r = {.slot = i, .sample = jobs[i]->server};
+            struct member *m = jobs[i].member;
+            if (https) {
+                probe_node(jobs[i], config, https, mark);
+            } else {
+                struct probe p = {.member = m, .timeout = timeout_ms, .mark = mark};
+                probe_one(&p);
+            }
+            struct reply r = {.slot = i, .sample = https ? m->https : m->server,
+                              .code = m->http_code, .standard_tls = m->standard_tls};
             /* One write below PIPE_BUF; concurrent workers cannot interleave. */
             ssize_t n;
             do { n = write(channel[1], &r, sizeof(r)); } while (n < 0 && errno == EINTR);
@@ -177,7 +188,12 @@ void probe_members(struct member **jobs, size_t count, long timeout_ms, uint32_t
         if (n < 0 && errno == EINTR) continue;
         if (n != (ssize_t)sizeof(r)) break;
         if (r.slot < count) {
-            jobs[r.slot]->server = r.sample;
+            struct member *m = jobs[r.slot].member;
+            if (https) {
+                m->https = r.sample;
+                m->http_code = r.code;
+                m->standard_tls = r.standard_tls;
+            } else m->server = r.sample;
             received[r.slot] = 1;
         }
     }
@@ -186,10 +202,13 @@ void probe_members(struct member **jobs, size_t count, long timeout_ms, uint32_t
         if (workers[i] <= 0) continue;
         if (!received[i]) {
             kill(workers[i], SIGKILL);
-            if (timed_out)
-                jobs[i]->server = (struct measurement) {
+            if (timed_out) {
+                struct member *m = jobs[i].member;
+                struct measurement *sample = https ? &m->https : &m->server;
+                *sample = (struct measurement) {
                     .state = "timeout", .detail = "dns_or_probe_timeout", .checked = time(NULL)
                 };
+            }
         }
         while (waitpid(workers[i], NULL, 0) < 0 && errno == EINTR) {}
     }

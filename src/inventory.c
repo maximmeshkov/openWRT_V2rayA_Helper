@@ -1,5 +1,6 @@
 #define _POSIX_C_SOURCE 200809L
 #include "helper.h"
+#include "node_profile.h"
 
 #include <arpa/inet.h>
 #include <ctype.h>
@@ -412,8 +413,9 @@ static int parse_inventory(json_object *names_data, json_object *touch_data, str
 	return 0;
 }
 
-static json_object *read_core_config(const char *path)
+json_object *node_config_read(const char *path)
 {
+	if (!path) return NULL;
 	int fd = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
 	if (fd < 0)
 		return NULL;
@@ -461,7 +463,7 @@ static json_object *unique_tag(json_object *array, const char *tag)
 	return found;
 }
 
-static json_object *core_outbound(json_object *config, const struct outbound *out, const struct member *m)
+json_object *node_config_outbound(json_object *config, const struct outbound *out, const struct member *m)
 {
 	json_object *outbounds = json_object_object_get(config, "outbounds");
 	if (out->count == 1)
@@ -493,7 +495,7 @@ static json_object *core_outbound(json_object *config, const struct outbound *ou
 	return tag ? unique_tag(outbounds, tag) : NULL;
 }
 
-static int same_core_endpoint(const char *api_address, json_object *core)
+int node_config_endpoint_matches(const char *api_address, json_object *core)
 {
 	const char *addr = field_text(core, "address");
 	int64_t port = field_int(core, "port");
@@ -520,7 +522,7 @@ static const char *xhttp_transport(json_object *core, const struct member *m)
 	if (!protocol || (strcmp(protocol, "vless") && strcmp(protocol, "vmess")) || !network ||
 	    (strcmp(network, "xhttp") && strcmp(network, "splithttp")) ||
 	    !json_object_is_type(servers, json_type_array) || json_object_array_length(servers) != 1 ||
-	    !same_core_endpoint(m->address, json_object_array_get_idx(servers, 0)))
+	    !node_config_endpoint_matches(m->address, json_object_array_get_idx(servers, 0)))
 		return "unknown";
 	json_object *sec = NULL;
 	const char *security = json_object_object_get_ex(stream, "security", &sec) ? json_text(sec) : "";
@@ -557,9 +559,9 @@ static void refine_xhttp(struct inventory *inv, const char *path)
 			const char *net = strchr(m->display_net, '(');
 			if (!net || (strncasecmp(net, "(xhttp", 6) && strncasecmp(net, "(splithttp", 10)))
 				continue;
-			if (!core && !(core = read_core_config(path)))
+			if (!core && !(core = node_config_read(path)))
 				return;
-			m->transport = xhttp_transport(core_outbound(core, out, m), m);
+			m->transport = xhttp_transport(node_config_outbound(core, out, m), m);
 		}
 	}
 	json_object_put(core);

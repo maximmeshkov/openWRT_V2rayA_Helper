@@ -16,6 +16,7 @@ local_api() {
 
 start_service() {
 	local api xray_config interval timeout workers mark token_file observatory observatory_max_age
+	local node_url node_code node_interval node_timeout
 	config_load v2raya_helper
 	config_get api main api
 	config_get xray_config main xray_config
@@ -30,6 +31,10 @@ start_service() {
 	config_get token_file main token_file
 	config_get observatory main observatory
 	config_get observatory_max_age main observatory_max_age
+	config_get node_url main node_url 'https://cp.cloudflare.com/generate_204'
+	config_get node_code main node_code 204
+	config_get node_interval main node_interval 60
+	config_get node_timeout main node_timeout 8
 
 	umask 077
 	mkdir -p /var/run/v2raya-helper || return 1
@@ -39,6 +44,10 @@ start_service() {
 		--output /var/run/v2raya-helper/status.json
 	[ -z "$token_file" ] || procd_append_param command --token-file "$token_file"
 	[ -z "$xray_config" ] || procd_append_param command --xray-config "$xray_config"
+	if [ -n "$xray_config" ] && [ -n "$node_url" ]; then
+		procd_append_param command --node-url "$node_url" --node-code "$node_code" \
+			--node-interval "$node_interval" --node-timeout "$node_timeout"
+	fi
 	[ -z "$observatory" ] || procd_append_param command --observatory "$observatory"
 	[ -z "$observatory_max_age" ] || procd_append_param command --observatory-max-age "$observatory_max_age"
 	procd_set_param respawn
