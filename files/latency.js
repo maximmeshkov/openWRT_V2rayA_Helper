@@ -62,7 +62,8 @@ function timeLabel(value, hours) {
 }
 
 function chartIsDark(canvas) {
-	for (var element = canvas.parentElement; element; element = element.parentElement) {
+	var surface = canvas.isConnected ? canvas.parentElement : document.body;
+	for (var element = surface; element; element = element.parentElement) {
 		var background = window.getComputedStyle(element).backgroundColor;
 		var rgb = /^rgba?\((\d+),\s*(\d+),\s*(\d+)(?:,\s*1(?:\.0+)?)?\)$/.exec(background);
 		if (rgb) return .2126 * rgb[1] + .7152 * rgb[2] + .0722 * rgb[3] < 128;
@@ -83,7 +84,7 @@ function draw(canvas, samples, now, hours, pens) {
 	canvas.height = Math.round(height * pixelRatio);
 	context.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0);
 	context.font = '12px sans-serif';
-	var left = width < 520 ? 62 : 77, right = width - 14, top = 18, bottom = 247;
+	var left = width < 520 ? 71 : 86, right = width - 14, top = 18, bottom = 247;
 	var dark = chartIsDark(canvas), gridColor = dark ? '#e0e0e0' : '#333333';
 	context.fillStyle = dark ? '#222222' : '#ffffff';
 	context.fillRect(0, 0, width, height);
@@ -117,7 +118,7 @@ function draw(canvas, samples, now, hours, pens) {
 	context.textBaseline = 'middle';
 	for (var tick = 0; tick <= ceiling; tick += step) {
 		line(left, y(tick), right, y(tick), gridColor, .24);
-		context.fillText(tick + ' ' + _('ms'), left - 6, y(tick));
+		context.fillText(tick + ' ' + _('ms'), left - 15, y(tick));
 	}
 	context.textBaseline = 'top';
 	for (var at = begin; at <= now; at += stepX) {
