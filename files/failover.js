@@ -1,6 +1,7 @@
 'use strict';
 'require view';
 'require rpc';
+'require session';
 
 var readContext = rpc.declare({
 	object: 'v2raya-helper',
@@ -17,6 +18,7 @@ var savePolicy = rpc.declare({
 });
 
 var candidateLimit = 64;
+var outboundKey = 'v2raya-helper-failover-outbound';
 
 function row(title, control) {
 	return E('div', { 'class': 'cbi-value' }, [
@@ -56,6 +58,21 @@ function errorText(reply, fallback) {
 	return reply && typeof reply.error === 'string' ? reply.error : fallback;
 }
 
+function validContext(reply) {
+	return reply && reply.ok === true && Array.isArray(reply.outbounds) &&
+		Array.isArray(reply.nodes) && Array.isArray(reply.policies);
+}
+
+function matchesSaved(requested, stored) {
+	return stored && Object.keys(requested).every(function(field) {
+		if (field === 'allow_restart') return true;
+		if (field === 'candidates')
+			return Array.isArray(stored.candidates) && requested.candidates.length === stored.candidates.length &&
+				requested.candidates.every(function(key, index) { return key === stored.candidates[index]; });
+		return requested[field] === stored[field];
+	});
+}
+
 return view.extend({
 	handleSave: null,
 	handleSaveApply: null,
@@ -67,14 +84,14 @@ return view.extend({
 
 	render: function(initialContext) {
 		var canWrite = L.hasViewPermission() === true;
-		var context, selected = '', busy = false;
-		var drafts = new Map(), saved = new Map(), catalogue = new Map(), dirty = new Set();
+		var context, selected = session.getLocalData(outboundKey) || '', busy = false;
+		var drafts = new Map(), saved = new Map(), catalogue = new Map(), dirty = new Set(), unverified = new Map();
 		var outbound = E('select', { 'id': 'failover-outbound', 'class': 'cbi-input-select' });
+		var modeLabels = { off: _('Off'), outage: _('On repeated outages'), scheduled: _('Inside a time window') };
 		var mode = E('select', { 'id': 'failover-mode', 'class': 'cbi-input-select' }, [
-			option('off', _('Off')),
-			option('outage', _('On repeated outages')),
-			option('scheduled', _('Inside a time window'))
+			option('off', modeLabels.off), option('outage', modeLabels.outage), option('scheduled', modeLabels.scheduled)
 		]);
+		var savedMode = E('p', { 'id': 'failover-saved-mode', 'class': 'cbi-section-descr', 'aria-live': 'polite' });
 		var failures = rangeInput('failover-failures', 3, 30);
 		var failureMethod = E('select', { 'id': 'failover-failure-method', 'class': 'cbi-input-select' }, [
 			option('consecutive', _('Consecutive failures')),
@@ -96,8 +113,11 @@ return view.extend({
 			'id': 'failover-search', 'class': 'cbi-input-text', 'type': 'search',
 			'placeholder': _('Filter servers')
 		});
-		var list = E('div', { 'class': 'cbi-value-field' });
+		var list = E('div', { 'class': 'cbi-value-field', 'style': 'max-height:22rem;overflow:auto' });
 		var count = E('p');
+		var removeUnavailable = E('button', {
+			'id': 'failover-remove-unavailable', 'type': 'button', 'class': 'btn cbi-button cbi-button-neutral'
+		}, [_('Remove unavailable selections')]);
 		var options = E('div', {}, [
 			row(_('How to count failures'), failureMethod),
 			row(_('Failed checks required'), failures),
@@ -120,9 +140,12 @@ return view.extend({
 		]);
 		var fields = E('fieldset', { 'class': 'cbi-section' }, [
 			row(_('Current server'), current),
-			row(_('Mode'), mode),
-			options, schedule,
-			row(_('Replacement servers'), search), list, count, confirmation
+			row(_('Mode'), mode), savedMode, options, schedule, confirmation
+		]);
+		var candidateFields = E('fieldset', { 'class': 'cbi-section' }, [
+			row(_('Replacement servers'), search),
+			E('div', { 'style': 'display:flex;flex-wrap:wrap;align-items:baseline;gap:.5em' }, [count, removeUnavailable]),
+			list
 		]);
 		var availability = E('p', { 'class': 'cbi-section-descr' });
 		var status = E('p', { 'role': 'status', 'aria-live': 'polite' });
@@ -138,10 +161,25 @@ return view.extend({
 			return drafts.get(selected);
 		}
 
+		function showSavedMode() {
+			var stored = saved.get(selected);
+			savedMode.textContent = '';
+			if (context && selected)
+				savedMode.textContent = stored ? _('Saved mode: %s').format(modeLabels[stored.mode]) : _('Default mode: Off');
+			if (context && dirty.has(selected))
+				savedMode.textContent += ' · ' + _('Unsaved changes');
+		}
+
+		function markEdited() {
+			dirty.add(selected);
+			unverified.delete(selected);
+			showSavedMode();
+		}
+
 		function updateControls() {
 			var enabled = mode.value !== 'off';
-			fields.hidden = !selected;
-			fields.disabled = busy || !context || !canWrite;
+			fields.hidden = candidateFields.hidden = !selected;
+			fields.disabled = candidateFields.disabled = busy || !context || !canWrite;
 			outbound.disabled = busy || !context || context.outbounds.length === 0;
 			options.hidden = !enabled;
 			windowRow.hidden = failureMethod.value !== 'window';
@@ -150,6 +188,7 @@ return view.extend({
 			save.hidden = !canWrite;
 			save.disabled = busy || !context || !selected || (enabled && !context.can_switch);
 			refresh.disabled = busy;
+			showSavedMode();
 		}
 
 		function rememberInputs() {
@@ -185,8 +224,8 @@ return view.extend({
 						chosen.delete(key);
 					}
 					draft().candidates = Array.from(chosen);
-					dirty.add(selected);
-					count.textContent = _('Selected servers: %d').format(chosen.size);
+					markEdited();
+					showCandidateCount();
 					message('', false);
 					if (missing)
 						showCandidates();
@@ -208,7 +247,16 @@ return view.extend({
 			});
 			if (!visible)
 				list.appendChild(E('p', {}, [_('No matching servers.')]));
-			count.textContent = _('Selected servers: %d').format(chosen.size);
+			showCandidateCount();
+		}
+
+		function showCandidateCount() {
+			var chosen = draft().candidates;
+			var missing = chosen.filter(function(key) { return !catalogue.has(key); }).length;
+			count.textContent = _('Selected servers: %d').format(chosen.length);
+			removeUnavailable.hidden = !missing || context.catalog_unavailable || !canWrite;
+			if (missing && !context.catalog_unavailable)
+				count.textContent += ' · ' + _('Unavailable: %d').format(missing);
 		}
 
 		function showOutbound() {
@@ -216,6 +264,7 @@ return view.extend({
 			confirm.checked = false;
 			search.value = '';
 			if (selected) {
+				session.setLocalData(outboundKey, selected);
 				if (!draft())
 					drafts.set(selected, newPolicy(selected, saved.get(selected)));
 				var policy = draft();
@@ -235,9 +284,9 @@ return view.extend({
 		}
 
 		function populate(reply) {
+			var requestedOutbound = selected || session.getLocalData(outboundKey);
 			outbound.textContent = '';
-			if (!reply || reply.ok !== true || !Array.isArray(reply.outbounds) ||
-			    !Array.isArray(reply.nodes) || !Array.isArray(reply.policies)) {
+			if (!validContext(reply)) {
 				context = null;
 				availability.textContent = '';
 				showOutbound();
@@ -256,6 +305,12 @@ return view.extend({
 				}
 			});
 			saved = new Map(reply.policies.map(function(policy) { return [policy.outbound, policy]; }));
+			unverified.forEach(function(policy, name) {
+				if (matchesSaved(policy, saved.get(name))) {
+					dirty.delete(name);
+					unverified.delete(name);
+				}
+			});
 			drafts.forEach(function(policy, name) {
 				if (!dirty.has(name))
 					drafts.delete(name);
@@ -263,8 +318,8 @@ return view.extend({
 			reply.outbounds.forEach(function(item) {
 				outbound.appendChild(option(item.name, item.name));
 			});
-			if (reply.outbounds.some(function(item) { return item.name === selected; }))
-				outbound.value = selected;
+			if (reply.outbounds.some(function(item) { return item.name === requestedOutbound; }))
+				outbound.value = requestedOutbound;
 			if (context.catalog_unavailable)
 				availability.textContent = _('The v2rayA server list is unavailable. You can disable saved automatic switching here.');
 			else if (!context.can_switch)
@@ -343,19 +398,27 @@ return view.extend({
 			}
 			if (validInteger(input.max_ms, 0, 60000))
 				policy.max_ms = Number(input.max_ms);
+			dirty.add(selected);
+			unverified.delete(selected);
 			return perform(async function() {
 				var reply = await savePolicy(policy);
 				if (!reply || reply.ok !== true) {
 					message(errorText(reply, _('Could not save switching settings.')), true);
 					return;
 				}
-				var updated = newPolicy(selected, policy);
-				delete updated.allow_restart;
-				saved.set(selected, updated);
-				drafts.set(selected, updated);
-				dirty.delete(selected);
-				showOutbound();
-				message(_('Switching settings saved.'), false);
+				unverified.set(policy.outbound, policy);
+				var verified = await readContext().catch(function() { return null; });
+				if (!validContext(verified)) {
+					message(_('The router accepted the save. Refresh to verify the stored settings.'), true);
+					return;
+				}
+				var stored = verified.policies.find(function(item) { return item.outbound === policy.outbound; });
+				var confirmed = matchesSaved(policy, stored);
+				populate(verified);
+				if (confirmed)
+					message(_('Saved %s: %s').format(policy.outbound, modeLabels[stored.mode]), false);
+				else
+					message(_('The settings read from the router differ from this draft.'), true);
 			}, _('Could not confirm that the switching settings were saved.'));
 		}
 
@@ -366,24 +429,30 @@ return view.extend({
 		});
 		mode.addEventListener('change', function() {
 			confirm.checked = false;
-			dirty.add(selected);
+			markEdited();
 			rememberInputs();
 			updateControls();
 			message('', false);
 		});
 		failureMethod.addEventListener('change', function() {
-			confirm.checked = false;
-			dirty.add(selected);
+			markEdited();
 			rememberInputs();
 			updateControls();
 		});
 		[failures, failureWindow, cooldown, latency, start, end].forEach(function(input) {
 			input.addEventListener('input', function() {
-				dirty.add(selected);
+				markEdited();
 				rememberInputs();
 			});
 		});
 		search.addEventListener('input', showCandidates);
+		removeUnavailable.addEventListener('click', function() {
+			if (!draft() || !canWrite || busy || !context || context.catalog_unavailable) return;
+			draft().candidates = draft().candidates.filter(function(key) { return catalogue.has(key); });
+			markEdited();
+			showCandidates();
+			message(_('Unavailable servers removed from this draft. Save to apply.'), false);
+		});
 		refresh.addEventListener('click', function() {
 			rememberInputs();
 			return perform(async function() {
@@ -397,7 +466,7 @@ return view.extend({
 			E('form', { 'submit': submit, 'novalidate': '' }, [
 				row(_('Outbound'), outbound), fields,
 				E('div', { 'class': 'cbi-page-actions' }, [refresh, ' ', save]),
-				status
+				status, candidateFields
 			])
 		]);
 	}
