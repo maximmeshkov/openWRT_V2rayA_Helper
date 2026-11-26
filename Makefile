@@ -2,7 +2,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=v2raya-helper
 PKG_VERSION:=0.1.0
-PKG_RELEASE:=17
+PKG_RELEASE:=18
 
 # LuCI's asset version follows luci-base. Give this view a package-specific URL.
 FAILOVER_VIEW:=failover-$(subst .,-,$(PKG_VERSION))-$(PKG_RELEASE)
@@ -67,6 +67,13 @@ define Package/luci-app-v2raya-helper/install
 	$(INSTALL_DATA) ./files/latency.js $(1)/www/luci-static/resources/view/v2raya-helper/
 	$(INSTALL_DATA) ./files/v2raya-helper.menu.json $(1)/usr/share/luci/menu.d/v2raya-helper.json
 	$(SED) 's|"path": "v2raya-helper/failover"|"path": "v2raya-helper/$(FAILOVER_VIEW)"|' $(1)/usr/share/luci/menu.d/v2raya-helper.json
+endef
+
+define Package/luci-app-v2raya-helper/postinst
+#!/bin/sh
+if [ -z "$${IPKG_INSTROOT}" ]; then
+	rm -f /tmp/luci-indexcache.*.json
+fi
 endef
 
 $(eval $(call BuildPackage,v2raya-helper))
