@@ -157,9 +157,16 @@ class ProbeCoreTest(MonitorHarness):
         self.stop()
         deadline = time.monotonic() + 5
         alive = {call["pid"] for call in self.calls()}
+
+        def still_running(pid):
+            try:
+                status = Path(f"/proc/{pid}/stat").read_text()
+            except (FileNotFoundError, ProcessLookupError):
+                return False
+            return status.rsplit(")", 1)[1].split()[0] != "Z"
+
         while alive and time.monotonic() < deadline:
-            alive = {pid for pid in alive if os.path.exists(f"/proc/{pid}") and
-                     Path(f"/proc/{pid}/stat").read_text().split(")")[-1].split()[0] != "Z"}
+            alive = {pid for pid in alive if still_running(pid)}
             time.sleep(0.05)
         self.assertEqual(alive, set(), "a probe core outlived its batch")
 
