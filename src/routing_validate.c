@@ -48,7 +48,8 @@ static int wait_for_validation(pid_t child, int64_t deadline)
     return 0;
 }
 
-static void validate_child(pid_t parent, int input, const char *core_binary, char *asset_env)
+static void validate_child(pid_t parent, int input, const struct core_kind *core, const char *core_binary,
+                           char *asset_env)
 {
     if (prctl(PR_SET_PDEATHSIG, SIGKILL) < 0 || getppid() != parent)
         _exit(126);
@@ -62,34 +63,37 @@ static void validate_child(pid_t parent, int input, const char *core_binary, cha
     if (output < 0 || dup2(output, STDOUT_FILENO) < 0 || dup2(output, STDERR_FILENO) < 0)
         _exit(126);
     if (output > STDERR_FILENO) close(output);
-    char *const argv[] = {(char *)core_binary, "run", "-test", "-c", "stdin:", NULL};
+    char *argv[8] = {(char *)core_binary};
+    size_t count = 1;
+    for (const char *const *arg = core->test_args; *arg && count < 7; arg++) argv[count++] = (char *)*arg;
+    argv[count] = NULL;
     /* Do not import XRAY_LOCATION_CONFDIR or other runtime settings. */
     char *const envp[] = {asset_env, NULL};
     execve(core_binary, argv, envp);
     _exit(126);
 }
 
-int xray_validate_config(const char *core_binary, const char *assets_dir,
+int core_validate_config(const struct core_kind *core, const char *core_binary, const char *assets_dir,
                          int input, unsigned int timeout_ms)
 {
-    if (!core_binary || core_binary[0] != '/' || !assets_dir || assets_dir[0] != '/' ||
+    if (!core || !core_binary || core_binary[0] != '/' || !assets_dir || assets_dir[0] != '/' ||
         !regular_file(core_binary, 0)) return 0;
 
-    char env[sizeof("XRAY_LOCATION_ASSET=") + PATH_MAX];
-    int env_len = snprintf(env, sizeof(env), "XRAY_LOCATION_ASSET=%s", assets_dir);
+    char env[32 + PATH_MAX];
+    int env_len = snprintf(env, sizeof(env), "%s=%s", core->asset_env, assets_dir);
     int64_t now = monotonic_ms();
     if (env_len < 0 || (size_t)env_len >= sizeof(env) || now < 0) return 0;
 
     pid_t parent = getpid();
     pid_t child = fork();
-    if (child == 0) validate_child(parent, input, core_binary, env);
+    if (child == 0) validate_child(parent, input, core, core_binary, env);
     return child > 0 && wait_for_validation(child, now + timeout_ms);
 }
 
-int routing_validate_advanced(const char *kind, const char *value,
+int routing_validate_advanced(const char *kind, const char *value, const struct core_kind *core,
                               const char *core_binary, const char *assets_dir)
 {
-    if (!kind || !value || !*value || strnlen(value, MAX_LITERAL + 1) > MAX_LITERAL ||
+    if (!core || !kind || !value || !*value || strnlen(value, MAX_LITERAL + 1) > MAX_LITERAL ||
         !core_binary || core_binary[0] != '/' || !assets_dir || assets_dir[0] != '/' ||
         !regular_file(core_binary, 0)) return 0;
 
@@ -105,7 +109,7 @@ int routing_validate_advanced(const char *kind, const char *value,
     if (asset) {
         char path[PATH_MAX];
         int len = snprintf(path, sizeof(path), "%s/%s", assets_dir, asset);
-        /* Xray can fall back to a system directory. Use the selected files. */
+        /* The core can fall back to a system directory. Use the selected files. */
         if (len < 0 || (size_t)len >= sizeof(path) || !regular_file(path, 1)) return 0;
     }
 
@@ -129,7 +133,7 @@ int routing_validate_advanced(const char *kind, const char *value,
     do { written = write(channel[1], config, (size_t)len); } while (written < 0 && errno == EINTR);
     close(channel[1]);
     int valid = written == len &&
-                xray_validate_config(core_binary, assets_dir, channel[0], VALIDATION_TIMEOUT_MS);
+                core_validate_config(core, core_binary, assets_dir, channel[0], VALIDATION_TIMEOUT_MS);
     close(channel[0]);
     return valid;
 }

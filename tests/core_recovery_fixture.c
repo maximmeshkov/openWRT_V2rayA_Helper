@@ -1,5 +1,5 @@
 #include "core_recovery.h"
-#include "failover_api.h"
+#include "capability.h"
 #include "helper.h"
 #include "node_profile.h"
 #include <stdio.h>
@@ -92,11 +92,11 @@ int v2raya_api_port_sharing(const struct v2raya_api *client, v2raya_login_peer p
     return -1;
 }
 
-int failover_api_can_switch(const struct v2raya_api *client, char *error, size_t len)
+enum capability capability_check_api(const struct v2raya_api *client, enum feature feature, char *reason, size_t len)
 {
-    (void)error;
+    (void)reason;
     (void)len;
-    return client == &api;
+    return client == &api && feature == FEATURE_CORE_START ? CAPABILITY_VERIFIED : CAPABILITY_DENIED;
 }
 
 json_object *v2raya_api_touch_data(const struct v2raya_api *client, char *error, size_t len)

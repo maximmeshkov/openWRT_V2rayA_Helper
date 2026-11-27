@@ -1,5 +1,6 @@
 #define _POSIX_C_SOURCE 200809L
 #include "helper.h"
+#include "capability.h"
 #include "node_key.h"
 #include "node_profile.h"
 #include "utf8.h"
@@ -548,15 +549,8 @@ int v2raya_api_save_routing(const struct v2raya_api *api, const char *expected_o
 		snprintf(error, len, "invalid or oversized RoutingA document");
 		return -1;
 	}
-	char *version = v2raya_api_get_version(api, error, len);
-	if (!version)
+	if (capability_check_api(api, FEATURE_ROUTING_SAVE, error, len) == CAPABILITY_DENIED)
 		return -1;
-	int can_save = !strcmp(version, "2.2.7.4");
-	free(version);
-	if (!can_save) {
-		snprintf(error, len, "saving RoutingA without a core restart is unverified for this v2rayA version");
-		return -1;
-	}
 	char token[TOKEN_LIMIT + 2];
 	if (read_token(api->token_file, token)) {
 		snprintf(error, len, "cannot read v2rayA authorization token");

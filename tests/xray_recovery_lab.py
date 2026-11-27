@@ -288,6 +288,8 @@ def run_case(args, recover, check_authorization=False, auto_login=None):
             host = f"[{management_host}]" if management_ipv6 else management_host
             address = f"{host}:{management_port}"
         env = dict(os.environ, XDG_RUNTIME_DIR=str(runtime), SSL_CERT_FILE=node.cert)
+        if args.allow_unverified:
+            env["V2RAYA_HELPER_ALLOW_UNVERIFIED"] = args.allow_unverified
         if owner_restart_dynamic:
             env["V2RAYA_IPV6_SUPPORT"] = "off"
             env.pop("V2RAYA_V2RAY_CONFDIR", None)
@@ -369,7 +371,7 @@ def run_case(args, recover, check_authorization=False, auto_login=None):
             return response.returncode == 0 and response.stdout == "204"
 
         version = wait(lambda: call("GET", "version"), "laboratory v2rayA API")
-        assert version["version"] == "2.2.7.4" and version["variant"] == "Xray", version
+        assert (version["version"], version["variant"]) == (args.expect_version, args.expect_variant), version
         if stock_transparent:
             assert not version["lite"], "stock transparent proxy requires full v2rayA"
         token = call("POST", "account", FIXTURE_LOGIN)["token"]
@@ -1196,6 +1198,11 @@ table ip recovery_lab_wan {{
                 return True
 
         def stays_down(message):
+            # A killed core can lose its /proc cmdline a moment before its listening
+            # socket closes. Let that socket go, then require the core to stay down.
+            released = time.monotonic() + 1
+            while not socks_refused() and time.monotonic() < released:
+                time.sleep(.05)
             for _ in range(8):
                 assert xray_pid() is None and socks_refused() and client_unavailable(), message
                 time.sleep(.5)
@@ -2185,6 +2192,12 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ("helper", "v2raya", "xray", "assets"):
         parser.add_argument("--" + name, type=lambda path: Path(path).resolve(strict=True), required=True)
+    # The version lab runs each v2rayA build; --xray is then the core that build runs.
+    parser.add_argument("--expect-version", default="2.2.7.4")
+    parser.add_argument("--expect-variant", default="Xray")
+    parser.add_argument("--expect-core", default="Xray 25.10.15 ", help="start of the core's version line")
+    parser.add_argument("--allow-unverified", metavar="VERSION",
+                        help="pass the helper's opt-in for this exact v2rayA version")
     modes = parser.add_mutually_exclusive_group()
     modes.add_argument("--baseline-only", action="store_true")
     modes.add_argument("--auto-login-only", action="store_true")
@@ -2319,7 +2332,7 @@ def main():
     if not isolated and (os.geteuid() == 0 or args.namespace_origin is not None):
         parser.error("run as an unprivileged user in a disposable Linux environment")
     version = subprocess.check_output([args.xray, "version"], text=True, timeout=5)
-    assert version.splitlines()[0].startswith("Xray 25.10.15 "), version.splitlines()[0]
+    assert version.splitlines()[0].startswith(args.expect_core), version.splitlines()[0]
     if isolated or args.helper_restart:
         run_case(args, recover=not (args.server_failover or args.slow_reserve_failover or args.multi_outbound_failover))
         if args.ipv6_management and not args.expect_no_ipv6_recovery:

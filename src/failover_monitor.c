@@ -7,6 +7,7 @@
 #include "failover_policy.h"
 #include "failover_profile.h"
 #include "node_profile.h"
+#include "probe_core.h"
 #include "latency_history.h"
 #include <errno.h>
 #include <fcntl.h>
@@ -32,7 +33,7 @@ struct failover_monitor {
     char *lock_path, *last_path;
     char boot_id[BOOT_ID_LENGTH + 1];
     struct v2raya_api api;
-    struct https_options https;
+    const struct https_options *https; /* the daemon's, updated every cycle */
     struct latency_history *history;
     uint32_t mark;
     json_object *settings;
@@ -61,7 +62,7 @@ struct failover_monitor *failover_monitor_create(const char *path, const struct 
     if (!m) return NULL;
     m->path = path;
     m->api = *api;
-    m->https = *https;
+    m->https = https;
     m->history = history;
     m->mark = mark;
     boot_id_read(m->boot_id);
@@ -176,11 +177,12 @@ static enum failover_probe_state classify(const struct measurement *sample, long
     if (!strcmp(sample->state, "ok")) return FAILOVER_OK;
     if (http_code || (strcmp(sample->state, "timeout") && strcmp(sample->state, "error")))
         return FAILOVER_UNKNOWN;
-    if (!strcmp(sample->state, "timeout") || !strcmp(sample->detail, "https_timeout") ||
-        !strcmp(sample->detail, "xhttp_session_failed") || !strcmp(sample->detail, "https_connect_error") ||
-        !strcmp(sample->detail, "https_proxy_error"))
-        return FAILOVER_FAILED;
-    return FAILOVER_UNKNOWN;
+    /* Every failed HTTPS request through the server counts, TLS errors and
+     * dropped streams included: through the probe core a dead server shows up
+     * that way. Only the helper's own trouble says nothing about the server. */
+    if (!strcmp(sample->detail, "probe_unavailable") || !strcmp(sample->detail, "https_mark_error"))
+        return FAILOVER_UNKNOWN;
+    return FAILOVER_FAILED;
 }
 
 static struct failover_sample active_sample(const struct member *member)
@@ -206,19 +208,26 @@ static struct failover_sample probe_candidate(struct failover_monitor *m, const 
         if (length < 0 || (size_t)length >= sizeof(address) ||
             !failover_endpoint_normalize(address, endpoint) || strcmp(endpoint, node->endpoint)) goto done;
     }
+    int core_port = 0;
+    pid_t core = profile.node.kind == NODE_CORE ?
+                 probe_core_launch(&profile.node.outbound, 1, m->https, m->mark, &core_port) : -1;
+    if (core < 0) core_port = 0;
     int channel[2];
-    if (pipe2(channel, O_CLOEXEC | O_NONBLOCK) < 0) goto done;
+    if (pipe2(channel, O_CLOEXEC | O_NONBLOCK) < 0) {
+        probe_core_stop(core);
+        goto done;
+    }
     pid_t parent = getpid(), child = fork();
     if (!child) {
         close(channel[0]);
         if (prctl(PR_SET_PDEATHSIG, SIGKILL) < 0 || getppid() != parent) _exit(1);
-        result.sample = probe_https_profile(&profile.node, &m->https, m->mark, &result.code);
+        result.sample = probe_https_profile(&profile.node, m->https, m->mark, core_port, &result.code);
         _exit(write(channel[1], &result, sizeof(result)) == sizeof(result) ? 0 : 1);
     }
     close(channel[1]);
     if (child > 0) {
         struct pollfd ready = {.fd = channel[0], .events = POLLIN};
-        int polled = poll(&ready, 1, (int)(m->https.timeout * 1000 + 50));
+        int polled = poll(&ready, 1, (int)(m->https->timeout * 1000 + 50));
         if (polled <= 0 || read(channel[0], &result, sizeof(result)) != sizeof(result)) {
             result = (struct report){0};
             kill(child, SIGKILL);
@@ -229,6 +238,7 @@ static struct failover_sample probe_candidate(struct failover_monitor *m, const 
         while (waitpid(child, NULL, 0) < 0 && errno == EINTR) {}
     }
     close(channel[0]);
+    probe_core_stop(core);
 done:
     failover_profile_clear(&profile);
     latency_history_add(m->history, policy->outbound, node->name, node->key, &result.sample, "reserve");
@@ -321,7 +331,7 @@ static time_t confirm_active(struct failover_monitor *m, const struct failover_p
 {
     struct member checked = out->members[0];
     struct probe_job job = {.out = out, .member = &checked};
-    probe_members(&job, 1, m->https.timeout * 1000, m->mark, &m->https, config);
+    probe_members(&job, 1, m->https->timeout * 1000, m->mark, m->https, config);
     struct failover_sample result = active_sample(&checked);
     if ((active->state == FAILOVER_FAILED && result.state == FAILOVER_FAILED) ||
         (active->state == FAILOVER_OK && result.state == FAILOVER_OK && result.ms > (long)policy->max_ms))
@@ -361,6 +371,12 @@ static int switch_candidate(struct failover_monitor *m, const struct failover_po
         char *link = failover_api_profile(&m->api, candidate, error, sizeof(error));
         if (!link) break;
         struct failover_sample result = probe_candidate(m, candidate, policy, link);
+        if (!result.checked) {
+            /* No probe ran: a protocol the probe cannot run, or an endpoint that moved.
+             * Try the next reserve now rather than spend this turn on it. */
+            free(link);
+            continue;
+        }
         result.id = candidate->key;
         result.subscription = subscription;
         result.endpoint = candidate->endpoint;
@@ -421,7 +437,7 @@ int failover_monitor_tick(struct failover_monitor *m, const struct inventory *in
     }
     json_object *policies = reload_policies(m);
     if (!policies || !m->count) return 0;
-    long max_age = 2 * m->https.interval + m->https.timeout;
+    long max_age = 2 * m->https->interval + m->https->timeout;
     time_t now = time(NULL);
     long age = failover_cooldown_age(m->last_path, m->boot_id, now);
     if (age == FAILOVER_COOLDOWN_LEGACY_FUTURE || age == FAILOVER_COOLDOWN_EXPIRED) {

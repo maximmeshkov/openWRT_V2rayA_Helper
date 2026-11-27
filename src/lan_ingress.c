@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include "lan_ingress.h"
+#include "capability.h"
 #include "core_watch.h"
 #include "helper.h"
 #include "lan_ingress_netlink.h"
@@ -424,8 +425,7 @@ static int allows_redirect_restore(const struct v2raya_api *api)
     char error[128];
     json_object *doc = v2raya_api_version_data(api, error, sizeof(error));
     json_object *lite = json_object_object_get(doc, "lite");
-    int supported = is_string(json_object_object_get(doc, "version"), "2.2.7.4") &&
-                    is_string(json_object_object_get(doc, "variant"), "Xray") &&
+    int supported = doc && capability_decide(doc, FEATURE_REDIRECT_RESTORE, error, sizeof(error)) &&
                     json_object_is_type(lite, json_type_int) && json_object_get_int(lite) == 0;
     json_object_put(doc);
     if (!supported) return 0;

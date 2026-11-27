@@ -1,0 +1,8 @@
+dd55d11661a149bccd75383ba9e5632e3ab23b44912a7cf5c3b59d42c9352f8c  openwrt-sdk-23.05.5-mediatek-filogic_gcc-12.3.0_musl.Linux-x86_64.tar.xz
+97ac89bcd590cf882bad8e027d893ab073959628b69e9e43829a2ccfb1e11e29  openwrt-sdk-23.05.5-ramips-mt7621_gcc-12.3.0_musl.Linux-x86_64.tar.xz
+dc2ffaf036929630e3de601be2006829d57ed30d018ed4e9e71496bd75d9cbb6  openwrt-sdk-23.05.5-ath79-generic_gcc-12.3.0_musl.Linux-x86_64.tar.xz
+9e5b6813a3f810123391f5f3ea10dfd1c14be1a880f410c70ec4424bbd1573d2  openwrt-sdk-23.05.5-x86-64_gcc-12.3.0_musl.Linux-x86_64.tar.xz
+d9fd074f281823a3023e8f6a73aaac598018c898ec9ac4d1c507b596930d7482  openwrt-sdk-24.10.8-mediatek-filogic_gcc-13.3.0_musl.Linux-x86_64.tar.zst
+9dd11b0517883b016ad7684f5c408a3483eec5b2455b2ffe004c9edd84063e45  openwrt-sdk-24.10.8-ramips-mt7621_gcc-13.3.0_musl.Linux-x86_64.tar.zst
+e46c4d0127061486ef4ce681f527f8a3980702011cafbf7801aff965a366dd8d  openwrt-sdk-24.10.8-ath79-generic_gcc-13.3.0_musl.Linux-x86_64.tar.zst
+ac4a0405d2eea821b06f93c14ba13ffa90ad0457648903df7dde02570027ab21  openwrt-sdk-24.10.8-x86-64_gcc-13.3.0_musl.Linux-x86_64.tar.zst

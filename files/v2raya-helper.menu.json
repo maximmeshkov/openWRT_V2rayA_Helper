@@ -4,6 +4,12 @@
 		"order": 80,
 		"action": { "type": "firstchild" }
 	},
+	"admin/services/v2raya-helper/compatibility": {
+		"title": "Compatibility",
+		"order": 5,
+		"action": { "type": "view", "path": "v2raya-helper/compatibility" },
+		"depends": { "acl": [ "v2raya-helper-settings" ] }
+	},
 	"admin/services/v2raya-helper/routinga": {
 		"title": "RoutingA",
 		"order": 10,

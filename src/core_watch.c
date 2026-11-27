@@ -59,8 +59,13 @@ static struct local_endpoint management_endpoint(const char *api)
     memcpy(address, host, (size_t)(end - host));
     address[end - host] = '\0';
     if (ipv6 && *++end != ':') return result;
-    const char *port = end + 1;
-    if (!decimal(port) || strlen(port) > 5 || atoi(port) > 65535) return result;
+    /* The same API accepts a trailing slash, as in http://127.0.0.1:2017/. */
+    char port[6];
+    size_t digits = strspn(end + 1, "0123456789");
+    if (!digits || digits >= sizeof(port) || (end[1 + digits] && strcmp(end + 1 + digits, "/"))) return result;
+    memcpy(port, end + 1, digits);
+    port[digits] = '\0';
+    if (atoi(port) > 65535) return result;
 
     if (ipv6) {
         if (inet_pton(AF_INET6, address, &result.v6) != 1 || IN6_IS_ADDR_UNSPECIFIED(&result.v6) ||
@@ -375,6 +380,17 @@ static int is_core_run(pid_t pid, const char *config_path)
 
 static int same_effective_user(pid_t pid);
 
+/* v2rayA's own binary: "v2raya" from OpenWrt packages, "v2raya_linux_<arch>_<version>"
+ * from release downloads (cut to 15 characters in /proc/<pid>/stat), with the
+ * kernel's " (deleted)" suffix once an upgrade replaced the running file.
+ * The v2raya_core process of v2rayA 2.4 and later is its core, not v2rayA. */
+static int is_v2raya_name(const char *name)
+{
+    if (strncmp(name, "v2raya", 6)) return 0;
+    name += 6;
+    return !*name || !strcmp(name, " (deleted)") || !strncmp(name, "_linux_", 7);
+}
+
 static int find_management_owner(unsigned long long api_inode, struct core_watch_sample *sample)
 {
     DIR *proc = opendir("/proc");
@@ -389,7 +405,7 @@ static int find_management_owner(unsigned long long api_inode, struct core_watch
         struct process_info info;
         int inspected = process_info(pid, &info);
         if (inspected < 0) { valid = 0; break; }
-        if (!inspected || info.state == 'Z' || info.state == 'X' || strcmp(info.name, "v2raya") ||
+        if (!inspected || info.state == 'Z' || info.state == 'X' || !is_v2raya_name(info.name) ||
             !same_effective_user(pid)) continue;
         int owner = owns_socket(pid, api_inode);
         if (owner < 0 || (owner && sample->owner)) { valid = 0; break; }
@@ -404,8 +420,10 @@ static int find_management_owner(unsigned long long api_inode, struct core_watch
 
 static int find_managed_core(const char *config_path, struct core_watch_sample *sample)
 {
-    /* A previous Xray can still refer to the same path after v2rayA rewrites it.
-     * Only a child of the current management owner can be its live core. */
+    /* A previous core can still refer to the same path after v2rayA rewrites it.
+     * Only a child of the current management owner can be its live core. The
+     * binary's name says nothing: xray, v2ray, v2raya_core or any --v2ray-bin;
+     * the core is the child running "run --config=<this config>". */
     DIR *proc = opendir("/proc");
     if (!proc) return 0;
     int valid = 1;
@@ -418,8 +436,7 @@ static int find_managed_core(const char *config_path, struct core_watch_sample *
         struct process_info info;
         int inspected = process_info(pid, &info);
         if (inspected < 0) { valid = 0; break; }
-        if (!inspected || info.parent != sample->owner || info.state == 'Z' || info.state == 'X' ||
-            strcmp(info.name, "xray")) continue;
+        if (!inspected || info.parent != sample->owner || info.state == 'Z' || info.state == 'X') continue;
         int core = is_core_run(pid, config_path);
         if (core < 0 || (core && sample->core)) { valid = 0; break; }
         if (core) {
@@ -467,7 +484,7 @@ static int same_owner_alive(const struct core_watch_sample *sample)
     struct process_info owner;
     return sample && sample->owner > 0 && process_info(sample->owner, &owner) == 1 &&
            owner.started == sample->owner_started && owner.state != 'Z' && owner.state != 'X' &&
-           !strcmp(owner.name, "v2raya");
+           is_v2raya_name(owner.name);
 }
 
 static int redirect_has_no_hooks(pid_t owner)
@@ -498,8 +515,7 @@ unsigned long long core_watch_redirect_listener(const struct core_watch_sample *
     struct process_info core;
     if (!same_owner_alive(sample) || !sample->core_started || process_info(sample->core, &core) != 1 ||
         core.parent != sample->owner || core.started != sample->core_started ||
-        core.state == 'Z' || core.state == 'X' || strcmp(core.name, "xray") ||
-        !redirect_has_no_hooks(sample->owner)) return 0;
+        core.state == 'Z' || core.state == 'X' || !redirect_has_no_hooks(sample->owner)) return 0;
     unsigned long long inode = 0;
     for (int ipv6 = 0; ipv6 < 2; ++ipv6) {
         FILE *table = fopen(ipv6 ? "/proc/net/tcp6" : "/proc/net/tcp", "re");
@@ -723,7 +739,7 @@ static int trusted_executable(pid_t pid)
     if (length <= 0 || (size_t)length == sizeof(name) - 1) return 0;
     name[length] = '\0';
     const char *base = strrchr(name, '/');
-    if (!base || strcmp(base + 1, "v2raya")) return 0;
+    if (!base || !is_v2raya_name(base + 1)) return 0;
 
     int fd = open(link, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
     if (fd < 0) return 0;

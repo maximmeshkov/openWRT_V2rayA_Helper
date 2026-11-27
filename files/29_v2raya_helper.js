@@ -25,8 +25,7 @@ function reading(result, route) {
 		result.http_code >= 100 && result.http_code <= 599;
 	var title = result.detail || '';
 	if (active)
-		title = [_('HTTPS check'), result.target, result.detail,
-			result.tls_client === 'libcurl' ? _('Helper uses its own TLS client') : null].filter(Boolean).join(' · ');
+		title = [_('HTTPS check'), result.target, result.detail].filter(Boolean).join(' · ');
 	else if (route && result.detail === 'observatory_http')
 		title = _('Xray Observatory');
 	switch (result.state) {

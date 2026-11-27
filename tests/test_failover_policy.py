@@ -276,6 +276,20 @@ class FailoverPolicyTest(unittest.TestCase):
         streak, active = self.streak(p, OK, 420)
         self.assertFalse(self.ready(p, streak, active))
 
+    def test_scheduled_slow_answers_and_failures_add_up(self):
+        p = self.policy(mode="scheduled", start="23:00", end="06:00", max_ms=300)
+        streak = Streak()
+        for offset, state, ms in ((60, OK, 420), (30, FAILED, 0), (0, OK, 420)):
+            active = Sample(b"main", state, ms, NOW - offset)
+            self.record(p, streak, active)
+        self.assertEqual((streak.failed, streak.slow), (0, 3))
+        self.assertTrue(self.ready(p, streak, active))
+        p = self.policy(mode="outage", max_ms=300)
+        streak = Streak()
+        for offset, state, ms in ((60, OK, 420), (30, FAILED, 0), (0, OK, 420)):
+            self.record(p, streak, Sample(b"main", state, ms, NOW - offset))
+        self.assertEqual((streak.failed, streak.slow), (0, 0))
+
     def test_settings_reject_invalid_policies_and_keep_prior_file(self):
         for overrides in ({"mode": "reboot"}, {"failures": 1}, {"failures": 31},
                           {"failure_method": "sliding"}, {"failure_method": None},

@@ -7,6 +7,18 @@
 			}
 		}
 	},
+	"v2raya-helper-settings": {
+		"description": "Read what this router runs and allow changes for an unverified v2rayA version",
+		"read": {
+			"ubus": {
+				"v2raya-helper": [ "environment" ]
+			},
+			"uci": [ "v2raya_helper" ]
+		},
+		"write": {
+			"uci": [ "v2raya_helper" ]
+		}
+	},
 	"v2raya-helper-routing": {
 		"description": "Read and edit v2rayA RoutingA rules",
 		"read": {

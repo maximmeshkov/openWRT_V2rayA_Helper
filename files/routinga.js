@@ -261,11 +261,13 @@ return view.extend({
 			positionsTotal = Number.isInteger(reply.positions_total) ? reply.positions_total : positions.length;
 			showPlacement();
 			if (!reply.can_save)
-				versionHint.textContent = _('Preview only. Saving without reconfiguring Xray is unverified for v2rayA %s.').format(reply.version || _('unknown'));
+				versionHint.textContent = _('Preview only. Saving is not verified for v2rayA %s; the Compatibility page can allow it.').format(reply.version || _('unknown'));
 			else if (!canWrite)
 				versionHint.textContent = _('Your LuCI account can preview rules. Saving requires write permission.');
+			else if (reply.save_verified === false)
+				versionHint.textContent = _('v2rayA %s is not verified: saving may make v2rayA restart its core.').format(reply.version || _('unknown'));
 			else
-				versionHint.textContent = _('Saved rules take effect the next time v2rayA rebuilds the Xray configuration.');
+				versionHint.textContent = _('Saved rules take effect the next time v2rayA rebuilds the core configuration.');
 			updateControls();
 		}
 

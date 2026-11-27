@@ -33,17 +33,15 @@ int main(int argc, char **argv) {
     const char *err = node_profile_parse(config, &o, members, &p);
     // Deliberately print only the public error, method and non-secret booleans.
     if (err) puts(err);
-    else printf("ok %s %d %d %d %d %d\n",
-                (const char *[]){"socks","http","https","xhttp"}[p.kind],
-                p.http_version, p.allow_insecure, p.has_mark && p.mark == 128,
-                *p.fingerprint != 0, *p.username && *p.password);
+    else printf("ok %s %d %d\n", (const char *[]){"socks","http","https","core"}[p.kind],
+                p.has_mark && p.mark == 128, *p.username && *p.password);
     json_object_put(config);
     return 0;
 }
 ''')
         cls.binary = root / "driver"
         subprocess.run(["cc", "-std=gnu11", "-Wall", "-Wextra", "-Werror", "-I", src, driver,
-                        src / "inventory.c", src / "node_profile.c", src / "node_key.c", "-lcurl", "-ljson-c",
+                        src / "inventory.c", src / "capability.c", src / "node_profile.c", src / "node_key.c", "-lcurl", "-ljson-c",
                         "-o", cls.binary], check=True)
         cls.config = root / "config.json"
 
@@ -64,29 +62,21 @@ int main(int argc, char **argv) {
         return subprocess.check_output([self.binary, self.config, endpoint, net, other], text=True).strip()
 
     def test_authenticated_proxies_and_rotation(self):
-        self.assertEqual(self.parse([self.proxy]), "ok socks 0 0 1 0 1")
+        self.assertEqual(self.parse([self.proxy]), "ok socks 1 1")
         server = self.proxy["settings"]["servers"][0]
         server.update(address="proxy.invalid", port=8443)
-        self.assertFalse(self.parse([self.proxy]).startswith("ok"))
+        self.assertEqual(self.parse([self.proxy]), "profile endpoint differs from v2rayA")
         self.assertTrue(self.parse([self.proxy], endpoint="proxy.invalid:8443").startswith("ok socks"))
-        self.assertFalse(self.parse([self.proxy], endpoint="proxy.invalid:8443", net="http").startswith("ok"))
         self.proxy["protocol"] = "http"
         self.assertTrue(self.parse([self.proxy], endpoint="proxy.invalid:8443", net="http").startswith("ok http "))
         self.proxy["streamSettings"].update(network="tcp", security="tls", tlsSettings={"serverName": "proxy.invalid"})
-        self.assertEqual(self.parse([self.proxy], endpoint="proxy.invalid:8443", net="https"), "ok https 0 0 1 0 1")
-        tls = self.proxy["streamSettings"]["tlsSettings"]
-        tls["allowInsecure"] = True
-        self.assertEqual(self.parse([self.proxy], endpoint="proxy.invalid:8443", net="https"),
-                         "HTTPS proxy with allowInsecure is unsupported")
-        tls["allowInsecure"] = False
-        self.proxy["streamSettings"]["tlsSettings"]["serverName"] = "other.invalid"
-        self.assertFalse(self.parse([self.proxy], endpoint="proxy.invalid:8443", net="https").startswith("ok"))
+        self.assertEqual(self.parse([self.proxy], endpoint="proxy.invalid:8443", net="https"), "ok https 1 1")
 
-    def test_plain_proxy_never_ignores_transport_or_account_settings(self):
+    def test_what_libcurl_cannot_reproduce_goes_to_the_core(self):
+        # A plain proxy runs natively only when libcurl can reach it exactly as configured.
         for root, key, value in [
             (("streamSettings",), "security", "tls"), (("streamSettings",), "tlsSettings", {}),
-            (("streamSettings",), "network", "ws"),
-            (("streamSettings", "sockopt"), "dialerProxy", "other"),
+            (("streamSettings",), "network", "ws"), ((), "mux", {"enabled": True}),
             (("settings", "servers", 0), "version", "4"),
             (("settings", "servers", 0, "users", 0), "user", "private\0truncated"),
         ]:
@@ -96,37 +86,23 @@ int main(int argc, char **argv) {
                 for sub in root:
                     target = target[sub]
                 target[key] = value
-                self.assertFalse(self.parse([config]).startswith("ok"))
+                self.assertEqual(self.parse([config]), "ok core 0 0")
+        self.assertEqual(self.parse([self.proxy], net="http"), "ok core 0 0")
 
-    def test_xhttp_and_alpn(self):
-        def run():
-            return self.parse([self.xhttp], "node.invalid:443", "vless(xhttp+tls)")
-        tls = self.xhttp["streamSettings"]["tlsSettings"]
-        self.assertEqual(run(), "ok xhttp 2 0 1 1 0")
-        xhttp = self.xhttp["streamSettings"]["xhttpSettings"]
-        xhttp["path"] = "test bench?flag=1"
-        self.assertEqual(run(), "ok xhttp 2 0 1 1 0")
-        xhttp["path"] = "test?unsafe=raw space"
-        self.assertFalse(run().startswith("ok"))
-        xhttp["path"] = "/test"
-        tls.update(alpn=["http/1.1"], allowInsecure=True)
-        self.assertEqual(run(), "ok xhttp 1 1 1 1 0")
-        xhttp["mode"] = "stream-up"
-        self.assertFalse(run().startswith("ok"))
-        xhttp["mode"] = "packet-up"
-        tls["alpn"] = ["h3"]
-        self.assertFalse(run().startswith("ok"))
-        self.assertFalse(self.parse([self.xhttp], "node.invalid:443", "vmess(xhttp+tls)").startswith("ok"))
-
-    def test_unimplemented_profile_features_stay_unknown(self):
+    def test_core_runs_any_protocol_at_the_reported_endpoint(self):
+        self.assertEqual(self.parse([self.xhttp], "node.invalid:443", "vless(xhttp+tls)"), "ok core 0 0")
+        trojan = {"tag": "my-out", "protocol": "trojan", "settings": {"servers": [
+            {"address": "node.invalid", "port": 443, "password": "fixture-only"}]},
+            "streamSettings": {"network": "grpc", "security": "reality"}}
+        shadowsocks = {"tag": "my-out", "protocol": "shadowsocks", "settings": {"servers": [
+            {"address": "node.invalid", "port": 443, "method": "aes-256-gcm", "password": "fixture-only"}]}}
+        for config in (trojan, shadowsocks):
+            with self.subTest(protocol=config["protocol"]):
+                self.assertEqual(self.parse([config], "node.invalid:443", "any"), "ok core 0 0")
         for root, key, value in [
-            ((), "proxySettings", {"tag": "chain"}), ((), "mux", {"enabled": True}),
-            (("streamSettings", "sockopt"), "dialerProxy", "other"),
-            (("streamSettings", "tlsSettings"), "pinnedPeerCertSha256", "fixture-only"),
+            ((), "mux", {"enabled": True}), (("streamSettings", "tlsSettings"), "pinnedPeerCertSha256", "x"),
             (("streamSettings", "xhttpSettings"), "downloadSettings", {}),
             (("settings", "vnext", 0, "users", 0), "flow", "xtls-rprx-vision"),
-            (("settings", "vnext", 0, "users", 0), "id", "bad-uuid"),
-            (("settings", "vnext", 0), "port", 444),
         ]:
             with self.subTest(key=key):
                 config = copy.deepcopy(self.xhttp)
@@ -134,15 +110,30 @@ int main(int argc, char **argv) {
                 for sub in root:
                     target = target[sub]
                 target[key] = value
-                error = self.parse([config], "node.invalid:443", "vless(xhttp+tls)")
-                self.assertFalse(error.startswith("ok"))
-                self.assertNotIn("fixture-only", error)
+                self.assertEqual(self.parse([config], "node.invalid:443", "vless(xhttp+tls)"), "ok core 0 0")
+
+    def test_core_refuses_chains_and_other_endpoints(self):
+        for root, key, value, error in [
+            ((), "proxySettings", {"tag": "chain"}, "proxy chains are unsupported"),
+            (("streamSettings", "sockopt"), "dialerProxy", "other", "proxy chains are unsupported"),
+            (("settings", "vnext", 0), "port", 444, "profile endpoint differs from v2rayA"),
+        ]:
+            with self.subTest(key=key):
+                config = copy.deepcopy(self.xhttp)
+                target = config
+                for sub in root:
+                    target = target[sub]
+                target[key] = value
+                self.assertEqual(self.parse([config], "node.invalid:443", "vless(xhttp+tls)"), error)
+        self.xhttp["settings"]["vnext"].append(self.xhttp["settings"]["vnext"][0])
+        self.assertEqual(self.parse([self.xhttp], "node.invalid:443", "vless(xhttp+tls)"),
+                         "outbound has no single server")
 
     def test_ambiguous_profiles(self):
         self.assertFalse(self.parse([self.proxy, self.proxy]).startswith("ok"))
         users = self.proxy["settings"]["servers"][0]["users"]
         users.append(users[0])
-        self.assertFalse(self.parse([self.proxy]).startswith("ok"))
+        self.assertEqual(self.parse([self.proxy]), "ok core 0 0")
         users.pop()
         self.proxy["settings"]["servers"].append(self.proxy["settings"]["servers"][0])
         self.assertFalse(self.parse([self.proxy]).startswith("ok"))

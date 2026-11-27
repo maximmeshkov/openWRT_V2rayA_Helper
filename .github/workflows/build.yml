@@ -19,50 +19,29 @@ jobs:
 
   package:
     runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        release: ['23.05.5', '24.10.8']
+        # 64-bit LE ARM, 32-bit LE MIPS, 32-bit BE MIPS, x86-64
+        target: [mediatek/filogic, ramips/mt7621, ath79/generic, x86/64]
     steps:
       - uses: actions/checkout@v4
-      - name: Build OpenWrt 23.05.5 packages for BPI-R3
-        shell: bash
+      - name: Install build dependencies
         run: |
-          set -euo pipefail
           sudo apt-get update -qq
+          # libcurl and json-c headers build the host-side test fixtures.
           sudo apt-get install -y build-essential clang flex bison gawk gettext libncurses-dev \
-            libssl-dev libelf-dev python3-distutils rsync unzip zlib1g-dev file zstd swig qemu-user
-          archive=openwrt-sdk-23.05.5-mediatek-filogic_gcc-12.3.0_musl.Linux-x86_64.tar.xz
-          cd "$RUNNER_TEMP"
-          curl -fL --retry 3 -O "https://downloads.openwrt.org/releases/23.05.5/targets/mediatek/filogic/$archive"
-          echo "dd55d11661a149bccd75383ba9e5632e3ab23b44912a7cf5c3b59d42c9352f8c  $archive" | sha256sum -c -
-          mkdir sdk
-          tar -xf "$archive" --strip-components=1 -C sdk
-          cd sdk
-          fetch_feed() {
-            local name=$1 repo=$2 ref=$3
-            local dir="$PWD/release-feeds/$name"
-            git init -q "$dir"
-            git -C "$dir" fetch -q --depth=1 "https://github.com/openwrt/$repo.git" "$ref"
-            git -C "$dir" checkout -q --detach FETCH_HEAD
-            echo "src-link $name $dir" >> feeds.conf
-          }
-          : > feeds.conf
-          fetch_feed base openwrt 28cf53e6bd9bb68958aae7958e7950d967f02b46
-          fetch_feed packages packages b5ed85f6e94aa08de1433272dc007550f4a28201
-          fetch_feed luci luci 63ba3cba5b7bfb803a875d4d8f01248634687fd5
-          mkdir -p package/v2raya-helper
-          cp -r "$GITHUB_WORKSPACE"/{Makefile,files,src} package/v2raya-helper/
-          ./scripts/feeds update -a
-          ./scripts/feeds install libcurl libjson-c ca-bundle rpcd luci-mod-status
-          printf '%s\n' CONFIG_PACKAGE_v2raya-helper=m CONFIG_PACKAGE_luci-app-v2raya-helper=m >> .config
-          make defconfig
-          make -j"$(nproc)" package/v2raya-helper/compile V=s
-          sh "$GITHUB_WORKSPACE/tests/sdk_binary.sh" "$PWD"
-          mkdir "$GITHUB_WORKSPACE/packages"
-          find bin/packages -name '*v2raya-helper_*.ipk' -exec cp '{}' "$GITHUB_WORKSPACE/packages" \;
-          cd "$GITHUB_WORKSPACE/packages"
-          test -f "$(ls v2raya-helper_*.ipk)"
-          test -f "$(ls luci-app-v2raya-helper_*.ipk)"
-          sha256sum *.ipk > SHA256SUMS
+            libssl-dev libelf-dev python3-distutils rsync unzip zlib1g-dev file zstd swig qemu-user \
+            libcurl4-openssl-dev libjson-c-dev
+      - name: Build OpenWrt ${{ matrix.release }} packages for ${{ matrix.target }}
+        working-directory: ${{ runner.temp }}
+        run: bash "$GITHUB_WORKSPACE/.github/sdk-package.sh" '${{ matrix.release }}' '${{ matrix.target }}' "$GITHUB_WORKSPACE/packages"
+      - name: Name the artifact
+        id: artifact
+        run: echo "name=openwrt-${{ matrix.release }}-$(echo '${{ matrix.target }}' | tr / -)" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@v4
         with:
-          name: openwrt-23.05.5-mediatek-filogic
+          name: ${{ steps.artifact.outputs.name }}
           path: packages/
           if-no-files-found: error

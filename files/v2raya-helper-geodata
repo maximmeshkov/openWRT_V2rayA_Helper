@@ -11,9 +11,12 @@ STATE="$RUN/geodata.state"
 LOCK="$OWN/job.lock"
 V2RAY=/usr/share/v2ray
 XRAY_ASSETS=/usr/share/xray
-ASSETS=/run/user/0/v2raya
-CONFIG=/etc/v2raya/config.json
-XRAY=/usr/bin/xray
+# rpcd passes the running core, its kind and asset directory (v2raya-helper env).
+absolute() { case "$1" in /*) printf '%s\n' "$1" ;; *) printf '%s\n' "$2" ;; esac; }
+ASSETS=$(absolute "$V2RAYA_HELPER_ASSETS" /run/user/0/v2raya)
+CONFIG=$(absolute "$V2RAYA_HELPER_CONFIG" /etc/v2raya/config.json)
+XRAY=$(absolute "$V2RAYA_HELPER_CORE" /usr/bin/xray)
+CORE_VARIANT=${V2RAYA_HELPER_CORE_VARIANT:-Xray}
 HELPER=/usr/bin/v2raya-helper
 FLOCK=/usr/bin/flock
 PROXY=http://127.0.0.1:20171
@@ -187,7 +190,7 @@ download() {
 }
 
 xray_test() {
-	"$HELPER" geodata-validate "$XRAY" "$STAGE"
+	"$HELPER" geodata-validate "$CORE_VARIANT" "$XRAY" "$STAGE"
 }
 
 test_tags() {
@@ -411,7 +414,8 @@ start() {
 		return
 	fi
 	exec 9>> "$LOCK" || exit 1
-	if ! "$FLOCK" -n 9; then
+	# Wait out a status read, which holds the lock for an instant; a real job keeps it far longer.
+	if ! "$FLOCK" -w 2 9; then
 		printf '{"ok":false,"error":"%s"}\n' "$(message_for busy)"
 	elif ! write_state running "$action" started; then
 		printf '{"ok":false,"error":"%s"}\n' "$(message_for setup)"

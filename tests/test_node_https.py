@@ -31,17 +31,19 @@ class NodeHTTPS(unittest.TestCase):
         harness.write_text(r'''
 #include "node_https.h"
 #include <curl/curl.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 int main(int argc, char **argv) {
+    /* The daemon ignores SIGPIPE (main.c); probes run with CURLOPT_NOSIGNAL. */
+    signal(SIGPIPE, SIG_IGN);
     if (argc != 5 || curl_global_init(CURL_GLOBAL_DEFAULT)) return 1;
     int handle = atoi(argv[2]);
     long expected = atol(argv[4]);
     struct node_https_proxy proxy = {.scheme = argv[1], .address = "127.0.0.1", .port = handle};
     struct node_https_result result;
-    int ok = !strcmp(argv[1], "fd") ? node_https_fd(handle, argv[3], 3000, expected, &result) :
-            node_https_proxy(&proxy, argv[3], 3000, 0, expected, &result);
+    int ok = node_https_proxy(&proxy, argv[3], 3000, 0, expected, &result);
     printf("%d %s %ld %ld\n", ok, result.detail, result.http_code, result.ms);
     curl_global_cleanup();
     return 0;
@@ -51,7 +53,7 @@ int main(int argc, char **argv) {
                         str(harness), str(SRC / "node_https.c"), "-lcurl",
                         "-o", cls.driver], check=True)
 
-    def origin(self, conn, host, trusted, status, observations):
+    def origin(self, conn, host, trusted, status, observations, body=0):
         # SSLObject operates over any byte stream, including the HTTP proxy's
         # outer TLS connection. Both certificates are verified by the client.
         incoming, outgoing = ssl.MemoryBIO(), ssl.MemoryBIO()
@@ -84,26 +86,26 @@ int main(int argc, char **argv) {
                 raise
             return
         observations.append(request.split(b"\r\n", 1)[0])
-        exchange(secure.write, f"HTTP/1.1 {status} fixture\r\nContent-Length: 0\r\n"
+        exchange(secure.write, f"HTTP/1.1 {status} fixture\r\nContent-Length: {body}\r\n"
                  "Location: https://should-not-follow.invalid/\r\n\r\n".encode())
+        try:
+            for _ in range(body // 16384):
+                exchange(secure.write, bytes(16384))
+        except (OSError, EOFError):
+            pass  # The client stops reading a large body after its limit.
 
-    def check(self, scheme, status, host="node.invalid", trusted=True, expected=204):
+    def check(self, scheme, status, host="node.invalid", trusted=True, expected=204, body=0):
         observations = []
         errors = []
-        client = listener = None
-        if scheme == "fd":
-            client, server = socket.socketpair()
-            handle = client.fileno()
-        else:
-            listener = socket.socket()
-            listener.bind(("127.0.0.1", 0))
-            listener.listen()
-            listener.settimeout(4)
-            handle = listener.getsockname()[1]
+        listener = socket.socket()
+        listener.bind(("127.0.0.1", 0))
+        listener.listen()
+        listener.settimeout(4)
+        handle = listener.getsockname()[1]
 
         def serve():
             try:
-                conn = server if listener is None else listener.accept()[0]
+                conn = listener.accept()[0]
                 if scheme == "https":
                     try:
                         conn = self.tls.wrap_socket(conn, server_side=True)
@@ -128,7 +130,7 @@ int main(int argc, char **argv) {
                             while stream.readline() not in (b"\r\n", b""):
                                 pass
                         conn.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
-                    self.origin(conn, host, trusted, status, observations)
+                    self.origin(conn, host, trusted, status, observations, body)
             except Exception as exc:
                 errors.append(exc)
 
@@ -142,13 +144,10 @@ int main(int argc, char **argv) {
                 env.pop("SSL_CERT_FILE", None)
             result = subprocess.check_output(
                 [self.driver, scheme, str(handle), f"https://{host}/check", str(expected)],
-                pass_fds=(() if client is None else (handle,)), timeout=5, text=True, env=env).split()
+                timeout=5, text=True, env=env).split()
         finally:
-            if client:
-                client.close()
             thread.join(4)
-            if listener:
-                listener.close()
+            listener.close()
         self.assertFalse(thread.is_alive())
         if errors:
             raise errors[0]
@@ -157,12 +156,15 @@ int main(int argc, char **argv) {
         self.assertGreaterEqual(int(result[3]), 0)
         return result[:3]
 
-    def test_socketpair_tls_and_origin_status(self):
-        self.assertEqual(self.check("fd", 204), ["1", "https_response", "204"])
-        self.assertEqual(self.check("fd", 301), ["0", "https_http_error", "301"])
-        self.assertEqual(self.check("fd", 200, expected=200), ["1", "https_response", "200"])
-        self.assertEqual(self.check("fd", 204, trusted=False), ["0", "https_tls_error", "0"])
-        self.assertEqual(self.check("fd", 204, host="wrong.invalid"), ["0", "https_tls_error", "0"])
+    def test_origin_status_and_verification_through_socks(self):
+        # The probe core's SOCKS inbound carries every server that libcurl cannot reach itself.
+        self.assertEqual(self.check("socks5h", 301), ["0", "https_http_error", "301"])
+        self.assertEqual(self.check("socks5h", 200, expected=200), ["1", "https_response", "200"])
+        self.assertEqual(self.check("socks5h", 204, trusted=False), ["0", "https_tls_error", "0"])
+        self.assertEqual(self.check("socks5h", 204, host="wrong.invalid"), ["0", "https_tls_error", "0"])
+
+    def test_large_body_still_reports_the_status(self):
+        self.assertEqual(self.check("socks5h", 200, expected=200, body=200000), ["1", "https_response", "200"])
 
     def test_proxy_performs_remote_dns_and_verified_get(self):
         self.assertEqual(self.check("socks5h", 204), ["1", "https_response", "204"])

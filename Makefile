@@ -2,7 +2,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=v2raya-helper
 PKG_VERSION:=0.1.0
-PKG_RELEASE:=51
+PKG_RELEASE:=52
 
 # LuCI's asset version follows luci-base. Give these views package-specific URLs.
 VIEW_VERSION:=$(subst .,-,$(PKG_VERSION))-$(PKG_RELEASE)
@@ -10,6 +10,7 @@ ROUTINGA_VIEW:=routinga-$(VIEW_VERSION)
 FAILOVER_VIEW:=failover-$(VIEW_VERSION)
 LATENCY_VIEW:=latency-$(VIEW_VERSION)
 GEODATA_VIEW:=geodata-$(VIEW_VERSION)
+COMPATIBILITY_VIEW:=compatibility-$(VIEW_VERSION)
 
 include $(INCLUDE_DIR)/package.mk
 
@@ -17,7 +18,7 @@ define Package/v2raya-helper
   SECTION:=net
   CATEGORY:=Network
   TITLE:=Background monitor for v2rayA outbounds
-  DEPENDS:=+libcurl +libjson-c +ca-bundle +rpcd
+  DEPENDS:=+libcurl +libjson-c +ca-bundle +rpcd +curl
   URL:=https://github.com/maximmeshkov/openWRT_V2rayA_Helper
 endef
 
@@ -54,6 +55,9 @@ define Package/v2raya-helper/install
 	$(INSTALL_BIN) ./files/v2raya-helper.rpc $(1)/usr/libexec/rpcd/v2raya-helper
 	$(INSTALL_BIN) ./files/v2raya-helper-geodata $(1)/usr/libexec/
 	$(INSTALL_DATA) ./files/v2raya-helper.acl.json $(1)/usr/share/rpcd/acl.d/v2raya-helper.json
+	# The default token and login files, which the README places outside /etc/config.
+	$(INSTALL_DIR) $(1)/lib/upgrade/keep.d
+	$(INSTALL_DATA) ./files/v2raya-helper.keep $(1)/lib/upgrade/keep.d/v2raya-helper
 endef
 
 define Package/v2raya-helper/postinst
@@ -61,7 +65,8 @@ define Package/v2raya-helper/postinst
 if [ -z "$${IPKG_INSTROOT}" ]; then
 	methods="$$(ubus -v list v2raya-helper 2>/dev/null)"
 	if ! printf '%s\n' "$$methods" | grep -q '"latency"' ||
-	   ! printf '%s\n' "$$methods" | grep -q '"geodata_start"'; then
+	   ! printf '%s\n' "$$methods" | grep -q '"geodata_start"' ||
+	   ! printf '%s\n' "$$methods" | grep -q '"environment"'; then
 		/etc/init.d/rpcd reload
 	fi
 fi
@@ -77,11 +82,13 @@ define Package/luci-app-v2raya-helper/install
 	$(INSTALL_DATA) ./files/failover.js $(1)/www/luci-static/resources/view/v2raya-helper/$(FAILOVER_VIEW).js
 	$(INSTALL_DATA) ./files/latency.js $(1)/www/luci-static/resources/view/v2raya-helper/$(LATENCY_VIEW).js
 	$(INSTALL_DATA) ./files/geodata.js $(1)/www/luci-static/resources/view/v2raya-helper/$(GEODATA_VIEW).js
+	$(INSTALL_DATA) ./files/compatibility.js $(1)/www/luci-static/resources/view/v2raya-helper/$(COMPATIBILITY_VIEW).js
 	$(INSTALL_DATA) ./files/v2raya-helper.menu.json $(1)/usr/share/luci/menu.d/v2raya-helper.json
 	$(SED) 's|"path": "v2raya-helper/routinga"|"path": "v2raya-helper/$(ROUTINGA_VIEW)"|' $(1)/usr/share/luci/menu.d/v2raya-helper.json
 	$(SED) 's|"path": "v2raya-helper/failover"|"path": "v2raya-helper/$(FAILOVER_VIEW)"|' $(1)/usr/share/luci/menu.d/v2raya-helper.json
 	$(SED) 's|"path": "v2raya-helper/latency"|"path": "v2raya-helper/$(LATENCY_VIEW)"|' $(1)/usr/share/luci/menu.d/v2raya-helper.json
 	$(SED) 's|"path": "v2raya-helper/geodata"|"path": "v2raya-helper/$(GEODATA_VIEW)"|' $(1)/usr/share/luci/menu.d/v2raya-helper.json
+	$(SED) 's|"path": "v2raya-helper/compatibility"|"path": "v2raya-helper/$(COMPATIBILITY_VIEW)"|' $(1)/usr/share/luci/menu.d/v2raya-helper.json
 endef
 
 define Package/luci-app-v2raya-helper/postinst

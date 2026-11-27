@@ -4,6 +4,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <time.h>
+#include <sys/types.h>
 #include <curl/curl.h>
 #include <json-c/json.h>
 
@@ -23,7 +24,6 @@ struct member {
     struct measurement server;
     struct measurement https;
     long http_code;
-    int standard_tls;
 };
 
 struct outbound {
@@ -52,16 +52,29 @@ struct probe_job {
     const struct outbound *out;
     struct member *member;
 };
+struct core_kind;
 struct https_options {
     const char *url;
     char host[256];
     int port;
     long code, interval, timeout;
+    /* The core v2rayA runs; the probe core starts the same binary. NULL when unknown. */
+    const char *core_binary;
+    const struct core_kind *core;
 };
 void probe_members(struct probe_job *jobs, size_t count, long timeout_ms, uint32_t mark,
                    const struct https_options *https, json_object *config);
+/* core_port: the probe core's SOCKS port for this member, or 0. */
 void probe_node(struct probe_job job, json_object *config, const struct https_options *options,
-                uint32_t mark);
+                uint32_t mark, int core_port);
+/* Start a probe core for these outbounds; ports[i] gets outbound i's SOCKS port.
+ * Returns the core's PID, or -1 when the core is unknown or did not start. */
+pid_t probe_core_launch(json_object *const *outbounds, size_t count, const struct https_options *https,
+                        uint32_t mark, int *ports);
+/* Start one probe core for the jobs whose server only the core can reach.
+ * ports[i] gets that job's SOCKS port or stays 0. Returns the core's PID or -1. */
+pid_t probe_core_for_jobs(struct probe_job *jobs, size_t count, json_object *config,
+                          const struct https_options *https, uint32_t mark, int *ports);
 CURLU *endpoint_url(const char *address);
 int64_t probe_clock_ms(void);
 struct measurement probe_quic(const char *address, long timeout_ms, uint32_t mark);

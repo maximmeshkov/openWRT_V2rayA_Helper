@@ -1,6 +1,5 @@
 #include "login_refresh.h"
 #include "core_watch.h"
-#include "failover_api.h"
 #include "login_files.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -12,8 +11,10 @@ static int refresh_token(const struct v2raya_api *api, const char *credentials_p
         snprintf(error, len, "v2rayA authorization renewal needs separate private login and token files");
         return -1;
     }
-    if (!failover_api_can_switch(api, error, len)) return -1;
-
+    /* POST /api/login takes {username, password} and returns data.token in both
+     * v2rayA 2.2.7.4 and 2.5.16 (controller/login.go), and the new token is
+     * checked with an authorized request before it replaces the old one, so
+     * renewal needs no version gate. */
     struct login_credentials credentials = {0};
     if (login_credentials_read(credentials_path, &credentials)) {
         snprintf(error, len, "cannot read the private v2rayA authorization credentials");

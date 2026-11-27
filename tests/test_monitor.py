@@ -204,7 +204,10 @@ class MonitorTest(MonitorHarness):
         self.sockets[0].settimeout(1)
         conn, _ = self.sockets[0].accept()  # Old endpoint really did receive the probe.
         conn.close()
-        self.wait_for(lambda d: server_state(d, "proxy") == "refused")
+        # qemu-user 6.2 returns the host's errno in SO_ERROR (111, not MIPS's 146),
+        # so under it a refused connection reads as a generic connect error.
+        emulated_mips = os.environ.get("V2RAYA_TEST_EMULATOR", "").startswith("qemu-mips")
+        self.wait_for(lambda d: server_state(d, "proxy") in (("refused", "error") if emulated_mips else ("refused",)))
         with self.api.lock:
             self.api.names.append("Another")
         self.wait_for(lambda d: rows(d).get("Another", {}).get("members") == [])

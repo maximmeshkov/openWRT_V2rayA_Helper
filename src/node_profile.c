@@ -58,33 +58,6 @@ static int host_name(const char *s)
 	return 1;
 }
 
-static int ascii_line(const char *s)
-{
-	if (!s) return 0;
-	for (const unsigned char *p = (const unsigned char *)s; *p; p++)
-		if (*p <= 32 || *p >= 127) return 0;
-	return 1;
-}
-
-static int authority_ok(const char *s)
-{
-	if (!ascii_line(s) || !*s || strlen(s) > 262) return 0;
-	return strspn(s, "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_.:[]") == strlen(s);
-}
-
-static int valid_uuid(const char *s)
-{
-	if (!s) return 0;
-	size_t len = strlen(s);
-	if (len != 32 && len != 36) return 0;
-	for (size_t i = 0; i < len; i++) {
-		if (len == 36 && (i == 8 || i == 13 || i == 18 || i == 23)) {
-			if (s[i] != '-') return 0;
-		} else if (!isxdigit((unsigned char)s[i])) return 0;
-	}
-	return 1;
-}
-
 static int socket_options(json_object *stream, struct node_profile *p)
 {
 	json_object *opts, *v;
@@ -99,78 +72,6 @@ static int socket_options(json_object *stream, struct node_profile *p)
 	return 1;
 }
 
-static int parse_alpn(json_object *tls, struct node_profile *p)
-{
-	p->http_version = 2;
-	json_object *v;
-	if (!json_object_object_get_ex(tls, "alpn", &v)) return 1;
-	if (!json_object_is_type(v, json_type_array)) return 0;
-	size_t count = json_object_array_length(v);
-	int h2 = 0;
-	for (size_t i = 0; i < count; i++) {
-		json_object *entry = json_object_array_get_idx(v, i);
-		if (!json_object_is_type(entry, json_type_string)) return 0;
-		const char *s = json_object_get_string(entry);
-		if (strlen(s) != (size_t)json_object_get_string_len(entry)) return 0;
-		if (!strcmp(s, "h2")) h2 = 1;
-		else if (!strcmp(s, "http/1.1")) {
-			if (count == 1) p->http_version = 1;
-		} else if (strcmp(s, "h3")) return 0;
-	}
-	return !count || h2 || p->http_version == 1;
-}
-
-static const char *parse_xhttp(json_object *stream, json_object *server, struct node_profile *p)
-{
-	json_object *tls = NULL, *xhttp = NULL, *alias;
-	if (!KEYS(stream, "network", "security", "tlsSettings", "xhttpSettings", "splithttpSettings", "sockopt"))
-		return "unsupported XHTTP stream options";
-	if (json_object_object_get_ex(stream, "tlsSettings", &tls) &&
-	    !KEYS(tls, "serverName", "alpn", "allowInsecure", "fingerprint"))
-		return "unsupported TLS settings";
-	if (!parse_alpn(tls, p)) return "unsupported XHTTP ALPN";
-	p->sni = text(tls, "serverName", "");
-	p->fingerprint = text(tls, "fingerprint", "");
-	if (!p->sni || !ascii_line(p->fingerprint) || !boolean(tls, "allowInsecure", &p->allow_insecure))
-		return "invalid TLS settings";
-	if (!*p->sni) p->sni = p->host;
-	if (!host_name(p->sni)) return "unsupported TLS server name";
-	int has_xhttp = json_object_object_get_ex(stream, "xhttpSettings", &xhttp);
-	if (json_object_object_get_ex(stream, "splithttpSettings", &alias)) {
-		if (has_xhttp) return "ambiguous XHTTP settings";
-		xhttp = alias;
-		has_xhttp = 1;
-	}
-	if (has_xhttp && !KEYS(xhttp, "path", "mode", "host")) return "unsupported XHTTP settings";
-	p->authority = text(xhttp, "host", "");
-	p->path = text(xhttp, "path", "/");
-	p->mode = text(xhttp, "mode", "auto");
-	if (!p->authority || !p->mode || !p->path || strlen(p->path) > 4096)
-		return "invalid XHTTP settings";
-	const char *query = strchr(p->path, '?');
-	if (query && (!ascii_line(query) || strchr(query, '#'))) return "invalid XHTTP query";
-	for (const unsigned char *c = (const unsigned char *)p->path; *c && *c != '?'; c++)
-		if (*c < 32 || *c == 127) return "invalid XHTTP path";
-	/* The relay derives a missing authority from SNI/destination and adds
-	 * the brackets required in a URL authority for an IPv6 destination. */
-	if (*p->authority && !authority_ok(p->authority)) return "unsupported XHTTP authority";
-	if (!*p->path) p->path = "/";
-	if (!*p->mode || !strcmp(p->mode, "auto")) p->mode = "packet-up";
-	if (strcmp(p->mode, "packet-up") && strcmp(p->mode, "stream-up") && strcmp(p->mode, "stream-one"))
-		return "unsupported XHTTP mode";
-	if (p->http_version == 1 && strcmp(p->mode, "packet-up"))
-		return "XHTTP stream modes require HTTP/2 in this helper";
-
-	json_object *user = single(server, "users");
-	if (!KEYS(user, "id", "encryption", "flow", "email", "level")) return "unsupported VLESS account";
-	const char *encryption = text(user, "encryption", NULL), *flow = text(user, "flow", "");
-	p->uuid = text(user, "id", NULL);
-	if (!valid_uuid(p->uuid) || !encryption || strcmp(encryption, "none") || !flow || *flow)
-		return "unsupported VLESS account";
-	p->kind = NODE_VLESS_XHTTP;
-	return NULL;
-}
-
 static const char *parse_proxy(json_object *stream, json_object *server, const char *protocol,
                                const char *security, const char *display, struct node_profile *p)
 {
@@ -182,12 +83,11 @@ static const char *parse_proxy(json_object *stream, json_object *server, const c
 	int has_tls = json_object_object_get_ex(stream, "tlsSettings", &tls);
 	if (!strcmp(protocol, "http") && !strcmp(security, "tls") && !strcasecmp(display, "https")) {
 		if (has_tls && !KEYS(tls, "serverName", "allowInsecure")) return "unsupported HTTPS proxy settings";
-		p->sni = text(tls, "serverName", p->host);
-		if (!p->sni || (*p->sni && strcasecmp(p->sni, p->host)) ||
-		    !boolean(tls, "allowInsecure", &p->allow_insecure))
+		const char *sni = text(tls, "serverName", p->host);
+		int allow_insecure = 0;
+		if (!sni || (*sni && strcasecmp(sni, p->host)) || !boolean(tls, "allowInsecure", &allow_insecure))
 			return "unsupported HTTPS proxy settings";
-		if (p->allow_insecure) return "HTTPS proxy with allowInsecure is unsupported";
-		p->sni = p->host;
+		if (allow_insecure) return "HTTPS proxy with allowInsecure is unsupported";
 		p->kind = NODE_HTTPS;
 	} else {
 		if (has_tls || (*security && strcmp(security, "none"))) return "unsupported proxy TLS settings";
@@ -211,13 +111,13 @@ static const char *parse_proxy(json_object *stream, json_object *server, const c
 	return NULL;
 }
 
-const char *node_profile_parse(json_object *config, const struct outbound *out,
-                              const struct member *m, struct node_profile *p)
+/* A plain SOCKS5 or HTTP(S) proxy that libcurl can reach exactly as configured. */
+static const char *parse_native(json_object *core, json_object *stream, const struct member *m,
+                                struct node_profile *p)
 {
-	*p = (struct node_profile){ .username = "", .password = "", .uuid = "", .sni = "",
-	                            .authority = "", .path = "", .mode = "", .fingerprint = "" };
-	json_object *core = node_config_outbound(config, out, m);
-	if (!core) return "outbound is missing or ambiguous in the core configuration";
+	const char *protocol = text(core, "protocol", NULL), *security = text(stream, "security", "");
+	if (!protocol || !security) return "invalid protocol or security";
+	if (strcmp(protocol, "http") && strcmp(protocol, "socks")) return "not a plain proxy";
 	if (!KEYS(core, "protocol", "tag", "settings", "streamSettings", "mux"))
 		return "unsupported outbound options or proxy chain";
 	json_object *mux;
@@ -225,30 +125,54 @@ const char *node_profile_parse(json_object *config, const struct outbound *out,
 	if (json_object_object_get_ex(core, "mux", &mux) &&
 	    (!KEYS(mux, "enabled", "concurrency") || !boolean(mux, "enabled", &enabled) || enabled))
 		return "unsupported outbound multiplexing";
-	json_object *settings = json_object_object_get(core, "settings"), *stream = NULL;
-	if (json_object_object_get_ex(core, "streamSettings", &stream) &&
-	    !json_object_is_type(stream, json_type_object))
-		return "invalid stream settings";
 	if (!socket_options(stream, p)) return "unsupported socket options";
-	const char *protocol = text(core, "protocol", NULL), *security = text(stream, "security", "");
-	if (!protocol || !security) return "invalid protocol or security";
-	int vless = !strcmp(protocol, "vless");
-	if (!vless && strcmp(protocol, "http") && strcmp(protocol, "socks"))
-		return "unsupported node protocol";
-	const char *list = vless ? "vnext" : "servers";
-	json_object *server = single(settings, list);
-	if (!KEYS(settings, list) || !KEYS(server, "address", "port", "users"))
+	json_object *settings = json_object_object_get(core, "settings");
+	json_object *server = single(settings, "servers");
+	if (!KEYS(settings, "servers") || !KEYS(server, "address", "port", "users"))
 		return "unsupported or ambiguous node configuration";
 	if (!node_config_endpoint_matches(m->address, server))
 		return "profile endpoint differs from v2rayA";
 	p->host = text(server, "address", NULL);
 	p->port = json_object_get_int(json_object_object_get(server, "port"));
 	if (!host_name(p->host)) return "invalid proxy server address";
-	if (!vless) return parse_proxy(stream, server, protocol, security, m->display_net, p);
-	const char *network = text(stream, "network", NULL);
-	if (!network || strcmp(security, "tls") ||
-	    !((!strcmp(network, "xhttp") && !strcasecmp(m->display_net, "vless(xhttp+tls)")) ||
-	      (!strcmp(network, "splithttp") && !strcasecmp(m->display_net, "vless(splithttp+tls)"))))
-		return "unsupported or mismatched VLESS transport";
-	return parse_xhttp(stream, server, p);
+	return parse_proxy(stream, server, protocol, security, m->display_net, p);
+}
+
+/* The core runs any protocol it knows, so only the server's identity is
+ * checked: one server with the address and port v2rayA reports. A chain needs
+ * outbounds the probe core does not have. */
+static const char *parse_core(json_object *core, json_object *stream, const struct member *m,
+                              struct node_profile *p)
+{
+	json_object *settings = json_object_object_get(core, "settings");
+	json_object *sockopt = json_object_object_get(stream, "sockopt");
+	if (json_object_object_get_ex(core, "proxySettings", NULL) || json_object_object_get_ex(sockopt, "dialerProxy", NULL))
+		return "proxy chains are unsupported";
+	json_object *server = single(settings, "vnext");
+	if (!server) server = single(settings, "servers");
+	if (!server) return "outbound has no single server";
+	if (!node_config_endpoint_matches(m->address, server))
+		return "profile endpoint differs from v2rayA";
+	p->host = text(server, "address", NULL);
+	p->port = json_object_get_int(json_object_object_get(server, "port"));
+	if (!host_name(p->host)) return "invalid server address";
+	p->outbound = core;
+	p->kind = NODE_CORE;
+	return NULL;
+}
+
+const char *node_profile_parse(json_object *config, const struct outbound *out,
+                              const struct member *m, struct node_profile *p)
+{
+	*p = (struct node_profile){.username = "", .password = ""};
+	json_object *core = node_config_outbound(config, out, m);
+	if (!core) return "outbound is missing or ambiguous in the core configuration";
+	json_object *stream = NULL;
+	if (json_object_object_get_ex(core, "streamSettings", &stream) && !json_object_is_type(stream, json_type_object))
+		return "invalid stream settings";
+	/* What libcurl cannot express exactly, such as a multiplexed or chained
+	 * proxy, goes to the core like every other protocol. */
+	if (!parse_native(core, stream, m, p)) return NULL;
+	*p = (struct node_profile){.username = "", .password = ""};
+	return parse_core(core, stream, m, p);
 }

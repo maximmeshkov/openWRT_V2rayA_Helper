@@ -1,7 +1,9 @@
 #!/bin/sh
 
-run_helper() {
-	local api address token_file state_file local_api parent pid core assets
+# Sets api, local_api and config: where v2rayA answers and where its core config lives.
+locate_api() {
+	local address
+	local_api=
 	api="$(uci -q get v2raya_helper.main.api)"
 	if [ -z "$api" ]; then
 		local_api=1
@@ -13,34 +15,59 @@ run_helper() {
 		esac
 		api="http://$address"
 	fi
+	config="$(uci -q get v2raya_helper.main.xray_config)"
+	config="${config:-/etc/v2raya/config.json}"
+}
+
+run_helper() {
+	local api local_api config token_file state_file environment core assets
+	locate_api
 	token_file="$(uci -q get v2raya_helper.main.token_file)"
+	V2RAYA_HELPER_ALLOW_UNVERIFIED="$(uci -q get v2raya_helper.main.allow_unverified)"
+	export V2RAYA_HELPER_ALLOW_UNVERIFIED
+	umask 077
 	case "$1" in
-		routing) state_file=/var/run/v2raya-helper/routing.lock ;;
+		environment) exec /usr/bin/v2raya-helper env "$api" "$config" ;;
+		routing)
+			# The lock lives in the daemon's private directory, which may not exist yet.
+			mkdir -p -m 700 /var/run/v2raya-helper
+			state_file=/var/run/v2raya-helper/routing.lock ;;
 		failover) state_file=/etc/config/v2raya-helper-failover.json ;;
 	esac
-	umask 077
 	if [ "$1" = routing ] && [ "$local_api" = 1 ]; then
-		parent="$(pidof v2raya)"
-		for pid in $(pidof xray); do
-			[ "$(awk '{print $4}' "/proc/$pid/stat" 2>/dev/null)" = "$parent" ] || continue
-			core="$(readlink "/proc/$pid/exe")"
-			assets="$(tr '\000' '\n' < "/proc/$pid/environ" |
-				awk '/^XRAY_LOCATION_ASSET=\// { sub(/^XRAY_LOCATION_ASSET=/, ""); print; exit }')"
-			if [ -x "$core" ] && [ -d "$assets" ]; then
-				exec /usr/bin/v2raya-helper "$1" "$2" "$api" "$token_file" "$state_file" "$core" "$assets"
-			fi
-		done
+		# The running core of v2rayA, whatever its binary is called, and its geo files.
+		environment="$(/usr/bin/v2raya-helper env "$api" "$config")"
+		core="$(printf '%s' "$environment" | jsonfilter -e '@.core.binary' 2>/dev/null)"
+		assets="$(printf '%s' "$environment" | jsonfilter -e '@.core.assets' 2>/dev/null)"
+		case "$core:$assets" in
+			/*:/*) [ -x "$core" ] && [ -d "$assets" ] &&
+				exec /usr/bin/v2raya-helper "$1" "$2" "$api" "$token_file" "$state_file" "$core" "$assets" ;;
+		esac
 	fi
 	exec /usr/bin/v2raya-helper "$1" "$2" "$api" "$token_file" "$state_file"
 }
 
+# The GeoData job validates with the core v2rayA runs and its asset directory.
+run_geodata() {
+	local api local_api config environment
+	locate_api
+	environment="$(/usr/bin/v2raya-helper env "$api" "$config")"
+	V2RAYA_HELPER_CORE="$(printf '%s' "$environment" | jsonfilter -e '@.core.binary' 2>/dev/null)"
+	V2RAYA_HELPER_CORE_VARIANT="$(printf '%s' "$environment" | jsonfilter -e '@.variant' 2>/dev/null)"
+	V2RAYA_HELPER_ASSETS="$(printf '%s' "$environment" | jsonfilter -e '@.core.assets' 2>/dev/null)"
+	V2RAYA_HELPER_CONFIG="$config"
+	export V2RAYA_HELPER_CORE V2RAYA_HELPER_CORE_VARIANT V2RAYA_HELPER_ASSETS V2RAYA_HELPER_CONFIG
+	exec /usr/libexec/v2raya-helper-geodata start "$1"
+}
+
 case "$1" in
 	list)
-		printf '%s\n' '{"status":{},"latency":{"outbound":""},"routing_context":{},"routing_preview":{"kind":"","value":"","outbound":"","before_line":0,"revision":""},"routing_save":{"kind":"","value":"","outbound":"","before_line":0,"revision":""},"failover_context":{},"failover_save":{"policy":{}},"geodata_status":{},"geodata_start":{"action":""}}'
+		printf '%s\n' '{"status":{},"environment":{},"latency":{"outbound":""},"routing_context":{},"routing_preview":{"kind":"","value":"","outbound":"","before_line":0,"revision":""},"routing_save":{"kind":"","value":"","outbound":"","before_line":0,"revision":""},"failover_context":{},"failover_save":{"policy":{}},"geodata_status":{},"geodata_start":{"action":""}}'
 		;;
 	call)
 		case "$2" in
 			latency) exec /usr/bin/v2raya-helper latency-rpc /var/run/v2raya-helper/latency.json ;;
+			environment) run_helper environment ;;
 			routing_context) run_helper routing context ;;
 			routing_preview) run_helper routing preview ;;
 			routing_save) run_helper routing save ;;
@@ -50,7 +77,7 @@ case "$1" in
 			geodata_start)
 				action="$(jsonfilter -e '@.action' 2>/dev/null)"
 				case "$action" in
-					update|restore) exec /usr/libexec/v2raya-helper-geodata start "$action" ;;
+					update|restore) run_geodata "$action" ;;
 					*) printf '%s\n' '{"ok":false,"error":"Unknown geodata action"}' ;;
 				esac
 				exit 0

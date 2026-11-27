@@ -266,15 +266,19 @@ void failover_record(struct failover_streak *streak, const struct failover_polic
     memcpy(streak->id, active->id, strlen(active->id) + 1);
     streak->checked = active->checked;
     streak->latest = active->state;
+    /* In scheduled hours `slow` counts bad checks: a failure is worse than a slow
+     * answer, so alternating slow answers and failures still add up. */
+    int counts_bad = policy->mode == FAILOVER_SCHEDULED && policy->max_ms;
     if (active->state == FAILOVER_FAILED) {
         if (streak->failed < policy->failures) streak->failed++;
         if (policy->failure_method == FAILOVER_WINDOW)
             record_window_failure(streak, policy, active->checked, now);
-        streak->slow = 0;
+        if (!counts_bad) streak->slow = 0;
+        else if (streak->slow < policy->failures) streak->slow++;
         return;
     }
     streak->failed = 0;
-    if (policy->mode == FAILOVER_SCHEDULED && policy->max_ms && active->ms > (long)policy->max_ms) {
+    if (counts_bad && active->ms > (long)policy->max_ms) {
         if (streak->slow < policy->failures) streak->slow++;
     } else {
         streak->slow = 0;
@@ -325,9 +329,9 @@ static int switch_conditions(const struct failover_policy *policy, const struct 
     unsigned failures = policy->failure_method == FAILOVER_WINDOW ?
         streak->window_count - expired_failures(streak, policy, now) : streak->failed;
     int failed = active->state == FAILOVER_FAILED && failures >= policy->failures;
-    int slow = policy->mode == FAILOVER_SCHEDULED && policy->max_ms &&
-        active->state == FAILOVER_OK && active->ms > (long)policy->max_ms &&
-        streak->slow >= policy->failures;
+    int bad = active->state == FAILOVER_FAILED ||
+        (active->state == FAILOVER_OK && active->ms > (long)policy->max_ms);
+    int slow = policy->mode == FAILOVER_SCHEDULED && policy->max_ms && bad && streak->slow >= policy->failures;
     return failed || slow;
 }
 

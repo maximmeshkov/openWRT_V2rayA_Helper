@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include "helper.h"
+#include "probe_core.h"
 #include <arpa/inet.h>
 #include <curl/curl.h>
 #include <errno.h>
@@ -134,20 +135,25 @@ done:
 void probe_members(struct probe_job *jobs, size_t count, long timeout_ms, uint32_t mark,
                    const struct https_options *https, json_object *config)
 {
-    struct reply { size_t slot; struct measurement sample; long code; int standard_tls; };
+    struct reply { size_t slot; struct measurement sample; long code; };
     int channel[2];
     pid_t workers[16] = {0};
-    int received[16] = {0};
+    int received[16] = {0}, core_ports[16] = {0};
     if (!count) return;
     for (size_t i = 0; i < count; ++i) {
         struct member *m = jobs[i].member;
         struct measurement *sample = https ? &m->https : &m->server;
-        if (https) { m->http_code = 0; m->standard_tls = 0; }
+        if (https) m->http_code = 0;
         *sample = (struct measurement) {
             .state = "unknown", .detail = "probe_unavailable", .checked = time(NULL)
         };
     }
-    if (pipe2(channel, O_CLOEXEC) < 0) return;
+    /* Started before the deadline below, so its startup does not eat the request time. */
+    pid_t core = https ? probe_core_for_jobs(jobs, count, config, https, mark, core_ports) : -1;
+    if (pipe2(channel, O_CLOEXEC) < 0) {
+        probe_core_stop(core);
+        return;
+    }
     const pid_t parent = getpid();
     /* Give a worker time to return its specific socket timeout to the parent. */
     const int64_t deadline = probe_clock_ms() + timeout_ms + 50;
@@ -158,13 +164,12 @@ void probe_members(struct probe_job *jobs, size_t count, long timeout_ms, uint32
             if (prctl(PR_SET_PDEATHSIG, SIGKILL) < 0 || getppid() != parent) _exit(1);
             struct member *m = jobs[i].member;
             if (https) {
-                probe_node(jobs[i], config, https, mark);
+                probe_node(jobs[i], config, https, mark, core_ports[i]);
             } else {
                 struct probe p = {.member = m, .timeout = timeout_ms, .mark = mark};
                 probe_one(&p);
             }
-            struct reply r = {.slot = i, .sample = https ? m->https : m->server,
-                              .code = m->http_code, .standard_tls = m->standard_tls};
+            struct reply r = {.slot = i, .sample = https ? m->https : m->server, .code = m->http_code};
             /* One write below PIPE_BUF; concurrent workers cannot interleave. */
             ssize_t n;
             do { n = write(channel[1], &r, sizeof(r)); } while (n < 0 && errno == EINTR);
@@ -192,7 +197,6 @@ void probe_members(struct probe_job *jobs, size_t count, long timeout_ms, uint32
             if (https) {
                 m->https = r.sample;
                 m->http_code = r.code;
-                m->standard_tls = r.standard_tls;
             } else m->server = r.sample;
             received[r.slot] = 1;
         }
@@ -212,4 +216,5 @@ void probe_members(struct probe_job *jobs, size_t count, long timeout_ms, uint32
         }
         while (waitpid(workers[i], NULL, 0) < 0 && errno == EINTR) {}
     }
+    probe_core_stop(core);
 }

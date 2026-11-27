@@ -1,4 +1,5 @@
 #include "failover_api.h"
+#include "capability.h"
 #include "node_key.h"
 #include "utf8.h"
 #include <limits.h>
@@ -240,14 +241,7 @@ static int same_node(const struct failover_node *a, const struct failover_node *
 
 int failover_api_can_switch(const struct v2raya_api *api, char *error, size_t len)
 {
-    json_object *version_data = v2raya_api_version_data(api, error, len);
-    if (!version_data) return 0;
-    const char *version = text(version_data, "version"), *variant = text(version_data, "variant");
-    int supported = version && !strcmp(version, "2.2.7.4") && variant && !strcmp(variant, "Xray");
-    json_object_put(version_data);
-    if (!supported)
-        snprintf(error, len, "automatic connection changes require v2rayA 2.2.7.4 with Xray");
-    return supported;
+    return capability_check_api(api, FEATURE_SWITCH, error, len) != CAPABILITY_DENIED;
 }
 
 int failover_api_connect(const struct v2raya_api *api, const char *outbound,

@@ -16,7 +16,8 @@ local_api() {
 
 start_service() {
 	local api xray_config interval timeout workers mark token_file observatory observatory_max_age
-	local node_url node_code node_interval node_timeout recover_xray restore_lan_redirect login_file
+	local node_url node_code node_interval node_timeout recover_xray restore_lan_redirect login_file allow_unverified
+	local probe_core
 	local respawn_threshold respawn_timeout respawn_retry
 	config_load v2raya_helper
 	config_get api main api
@@ -39,9 +40,12 @@ start_service() {
 	config_get node_timeout main node_timeout 8
 	config_get_bool recover_xray main recover_xray 0
 	config_get_bool restore_lan_redirect main restore_lan_redirect 0
+	config_get allow_unverified main allow_unverified
+	config_get probe_core main probe_core
 
 	umask 077
 	procd_open_instance
+	[ -z "$allow_unverified" ] || procd_set_param env V2RAYA_HELPER_ALLOW_UNVERIFIED="$allow_unverified"
 	procd_set_param command /usr/bin/v2raya-helper --api "$api" --interval "$interval" \
 		--timeout "$timeout" --workers "$workers" --mark "$mark" \
 		--output /var/run/v2raya-helper/status.json
@@ -54,6 +58,7 @@ start_service() {
 			--latency-file /var/run/v2raya-helper/latency.json \
 			--failover-file /etc/config/v2raya-helper-failover.json
 	fi
+	[ -z "$probe_core" ] || procd_append_param command --probe-core "$probe_core"
 	[ -z "$observatory" ] || procd_append_param command --observatory "$observatory"
 	[ -z "$observatory_max_age" ] || procd_append_param command --observatory-max-age "$observatory_max_age"
 	if [ "$recover_xray" = 1 ]; then

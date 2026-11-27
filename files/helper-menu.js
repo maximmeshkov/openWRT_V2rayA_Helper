@@ -4,7 +4,7 @@
 'require session';
 'require ui';
 
-var pages = ['routinga', 'failover', 'latency', 'geodata'];
+var pages = ['compatibility', 'routinga', 'failover', 'latency', 'geodata'];
 var refreshKey = 'v2raya-helper-menu-refreshed';
 var checked = false;
 

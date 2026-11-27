@@ -12,24 +12,14 @@
 #include <unistd.h>
 
 struct socket_options {
-    int fd, borrowed, mark_failed;
+    int mark_failed;
     uint32_t mark;
 };
-
-static curl_socket_t take_stream(void *opaque, curlsocktype purpose, struct curl_sockaddr *peer)
-{
-    struct socket_options *options = opaque;
-    if (purpose != CURLSOCKTYPE_IPCXN || peer->socktype != SOCK_STREAM || options->borrowed)
-        return CURL_SOCKET_BAD;
-    options->borrowed = 1;
-    return fcntl(options->fd, F_DUPFD_CLOEXEC, 0);
-}
 
 static int configure_socket(void *opaque, curl_socket_t fd, curlsocktype purpose)
 {
     struct socket_options *options = opaque;
     if (purpose != CURLSOCKTYPE_IPCXN) return CURL_SOCKOPT_ERROR;
-    if (options->fd >= 0) return CURL_SOCKOPT_ALREADY_CONNECTED;
     if (options->mark && setsockopt(fd, SOL_SOCKET, SO_MARK, &options->mark, sizeof(options->mark))) {
         options->mark_failed = 1;
         return CURL_SOCKOPT_ERROR;
@@ -79,11 +69,18 @@ static CURLU *proxy_url(const struct node_https_proxy *proxy)
     return NULL;
 }
 
+enum { BODY_LIMIT = 65536 };
+
+/* The status line is all the check needs. Stop reading a large body there;
+ * BODY_LIMIT + 1 in *received marks that stop as ours. */
 static size_t discard_body(char *data, size_t size, size_t count, void *opaque)
 {
     size_t *received = opaque;
     (void)data;
-    if (size && count > (65536 - *received) / size) return 0;
+    if (size && count > (BODY_LIMIT - *received) / size) {
+        *received = BODY_LIMIT + 1;
+        return 0;
+    }
     *received += size * count;
     return size * count;
 }
@@ -95,11 +92,10 @@ static int run_request(struct socket_options *options, const struct node_https_p
     if (!result) return 0;
     *result = (struct node_https_result){.detail = "https_invalid_config"};
     if (!url || strncasecmp(url, "https://", 8) || timeout_ms <= 0 ||
-        expected_code < 100 || expected_code > 599 || (options->fd < 0 && !proxy)) return 0;
+        expected_code < 100 || expected_code > 599 || !proxy) return 0;
 
     CURLU *target = curl_url(), *upstream = NULL;
     CURL *curl = curl_easy_init();
-    struct curl_slist *connect_to = NULL;
     char *proxy_string = NULL;
     const char *ca = getenv("SSL_CERT_FILE");
     size_t received = 0;
@@ -118,31 +114,22 @@ static int run_request(struct socket_options *options, const struct node_https_p
         curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, discard_body) ||
         curl_easy_setopt(curl, CURLOPT_WRITEDATA, &received)) goto done;
 
-    if (proxy) {
-        if (proxy->scheme && !strcmp(proxy->scheme, "https") &&
-            !(curl_version_info(CURLVERSION_NOW)->features & CURL_VERSION_HTTPS_PROXY)) {
-            result->detail = "unsupported_https_transport";
-            goto done;
-        }
-        upstream = proxy_url(proxy);
-        if (!upstream || curl_url_get(upstream, CURLUPART_URL, &proxy_string, 0) ||
-            curl_easy_setopt(curl, CURLOPT_PROXY, proxy_string) ||
-            (ca && *ca && !strcmp(proxy->scheme, "https") && curl_easy_setopt(curl, CURLOPT_PROXY_CAINFO, ca)) ||
-            curl_easy_setopt(curl, CURLOPT_PROXY_SSL_VERIFYPEER, 1L) ||
-            curl_easy_setopt(curl, CURLOPT_PROXY_SSL_VERIFYHOST, 2L) ||
-            (proxy->username && *proxy->username && curl_easy_setopt(curl, CURLOPT_PROXYUSERNAME, proxy->username)) ||
-            (proxy->password && *proxy->password && curl_easy_setopt(curl, CURLOPT_PROXYPASSWORD, proxy->password))) goto done;
-    } else {
-        /* Only the supplied fd is ever used. A numeric connect target suppresses
-         * local DNS while the original URL continues to govern SNI and TLS. */
-        connect_to = curl_slist_append(NULL, "::127.0.0.1:1");
-        if (!connect_to || curl_easy_setopt(curl, CURLOPT_CONNECT_TO, connect_to) ||
-            curl_easy_setopt(curl, CURLOPT_PROXY, "") ||
-            curl_easy_setopt(curl, CURLOPT_OPENSOCKETFUNCTION, take_stream) ||
-            curl_easy_setopt(curl, CURLOPT_OPENSOCKETDATA, options)) goto done;
+    if (proxy->scheme && !strcmp(proxy->scheme, "https") &&
+        !(curl_version_info(CURLVERSION_NOW)->features & CURL_VERSION_HTTPS_PROXY)) {
+        result->detail = "unsupported_https_transport";
+        goto done;
     }
+    upstream = proxy_url(proxy);
+    if (!upstream || curl_url_get(upstream, CURLUPART_URL, &proxy_string, 0) ||
+        curl_easy_setopt(curl, CURLOPT_PROXY, proxy_string) ||
+        (ca && *ca && !strcmp(proxy->scheme, "https") && curl_easy_setopt(curl, CURLOPT_PROXY_CAINFO, ca)) ||
+        curl_easy_setopt(curl, CURLOPT_PROXY_SSL_VERIFYPEER, 1L) ||
+        curl_easy_setopt(curl, CURLOPT_PROXY_SSL_VERIFYHOST, 2L) ||
+        (proxy->username && *proxy->username && curl_easy_setopt(curl, CURLOPT_PROXYUSERNAME, proxy->username)) ||
+        (proxy->password && *proxy->password && curl_easy_setopt(curl, CURLOPT_PROXYPASSWORD, proxy->password))) goto done;
 
     CURLcode rc = curl_easy_perform(curl);
+    if (rc == CURLE_WRITE_ERROR && received == BODY_LIMIT + 1) rc = CURLE_OK;
     curl_off_t elapsed_us = 0;
     curl_easy_getinfo(curl, CURLINFO_TOTAL_TIME_T, &elapsed_us);
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &result->http_code);
@@ -157,20 +144,12 @@ done:
     if (target) curl_url_cleanup(target);
     if (upstream) curl_url_cleanup(upstream);
     curl_free(proxy_string);
-    curl_slist_free_all(connect_to);
     return ok;
 }
 
 int node_https_proxy(const struct node_https_proxy *proxy, const char *url, long timeout_ms,
                      uint32_t mark, long expected_code, struct node_https_result *result)
 {
-    struct socket_options options = {.fd = -1, .mark = mark};
+    struct socket_options options = {.mark = mark};
     return run_request(&options, proxy, url, timeout_ms, expected_code, result);
-}
-
-int node_https_fd(int fd, const char *url, long timeout_ms, long expected_code,
-                  struct node_https_result *result)
-{
-    struct socket_options options = {.fd = fd};
-    return run_request(&options, NULL, url, timeout_ms, expected_code, result);
 }

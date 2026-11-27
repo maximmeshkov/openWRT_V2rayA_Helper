@@ -8,6 +8,8 @@
 #include "core_recovery.h"
 #include "lan_ingress.h"
 #include "login_refresh.h"
+#include "environment.h"
+#include "core_kind.h"
 #include <curl/curl.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -148,7 +150,6 @@ static int publish(const char *path, const struct stat *runtime, const struct in
                 json_object *probe = serialize_measure(valid ? m->https : unavailable, now, max_age);
                 add_string(probe, "source", "node_https");
                 add_string(probe, "target", https->host);
-                if (m->standard_tls) add_string(probe, "tls_client", "libcurl");
                 if (valid && m->http_code && m->https.checked <= now && now - m->https.checked <= max_age)
                     json_object_object_add(probe, "http_code", json_object_new_int64(m->http_code));
                 json_object_object_add(entry, "https", probe);
@@ -215,7 +216,6 @@ static void replace_inventory(struct inventory *old, struct inventory *next, int
                 out->members[j].server = prev->members[j].server;
                 out->members[j].https = prev->members[j].https;
                 out->members[j].http_code = prev->members[j].http_code;
-                out->members[j].standard_tls = prev->members[j].standard_tls;
             }
             break;
         }
@@ -238,7 +238,6 @@ static void sync_profiles(struct inventory *inv, const char *path, json_object *
                 m->https = next ? (struct measurement){.state="pending"} :
                     (struct measurement){.state="unknown", .detail="config_unavailable"};
                 m->http_code = 0;
-                m->standard_tls = 0;
             }
     }
     json_object_put(*config);
@@ -293,6 +292,27 @@ static size_t pick_jobs(struct inventory *inv, struct probe_job *jobs, size_t li
     return count;
 }
 
+/* The probe core runs the same binary as v2rayA's core, or the one given with
+ * --probe-core. Look it up in /proc before each batch; ask the API for the core
+ * kind only when v2rayA itself changed. */
+static void locate_core(struct environment *env, const char *api, const char *config_path,
+                        const char *probe_core, struct https_options *https)
+{
+    pid_t owner = env->owner;
+    unsigned long long started = env->owner_started;
+    environment_find_core(api, config_path, env);
+    if ((env->owner || probe_core) &&
+        (!env->version_data || env->owner != owner || env->owner_started != started))
+        environment_read_version(api, env);
+    https->core = core_kind_of(json_object_get_string(json_object_object_get(env->version_data, "variant")));
+    if (probe_core) {
+        https->core_binary = probe_core;
+        if (!https->core) https->core = core_kind_of("Xray");
+    } else {
+        https->core_binary = env->core && *env->core_binary == '/' ? env->core_binary : NULL;
+    }
+}
+
 static long number(const char *s, unsigned long min, unsigned long max)
 {
     char *end;
@@ -309,8 +329,10 @@ int main(int argc, char **argv)
 {
     if (argc > 1 && !strcmp(argv[1], "routing"))
         return routing_editor_command(argc - 2, argv + 2);
-    if (argc == 4 && !strcmp(argv[1], "geodata-validate"))
-        return xray_validate_config(argv[2], argv[3], STDIN_FILENO, 35000) ? 0 : 1;
+    if (argc > 1 && !strcmp(argv[1], "env"))
+        return environment_command(argc - 2, argv + 2);
+    if (argc == 5 && !strcmp(argv[1], "geodata-validate"))
+        return core_validate_config(core_kind_of(argv[2]), argv[3], argv[4], STDIN_FILENO, 35000) ? 0 : 1;
     if (argc > 1 && !strcmp(argv[1], "failover"))
         return failover_command(argc - 2, argv + 2);
     if (argc > 1 && !strcmp(argv[1], "latency"))
@@ -327,6 +349,7 @@ int main(int argc, char **argv)
     const char *output = DEFAULT_STATUS, *xray_config = NULL;
     const char *failover_file = NULL;
     const char *latency_file = NULL, *login_file = NULL, *recovery_state = NULL, *redirect_state = NULL;
+    const char *probe_core = NULL;
     struct https_options https = {.interval = 60, .timeout = 8, .code = 204};
     json_object *profiles = NULL;
     long interval = 10, timeout = 3, workers = 2, route_ttl = 60;
@@ -342,6 +365,7 @@ int main(int argc, char **argv)
         {"login-file",1,0,'L'},
         {"recover-xray",0,0,'R'}, {"recovery-state",1,0,'S'},
         {"restore-lan-redirect",0,0,'D'}, {"redirect-state",1,0,'P'},
+        {"probe-core",1,0,'B'},
         {"help",0,0,'h'}, {0,0,0,0}
     };
     int opt, recover_xray = 0, restore_redirect = 0;
@@ -368,18 +392,20 @@ int main(int argc, char **argv)
         case 'S': recovery_state = optarg; break;
         case 'D': restore_redirect = 1; break;
         case 'P': redirect_state = optarg; break;
+        case 'B': probe_core = optarg; break;
         case 'h':
             puts("v2raya-helper [--api URL] [--token-file PATH] [--output PATH]\n"
                  "  [--interval SECONDS] [--timeout SECONDS] [--workers 1..16] [--mark N]\n"
                  "  [--observatory LOOPBACK_URL] [--observatory-max-age SECONDS] [--xray-config PATH]\n"
                  "  [--node-url HTTPS_URL --node-code STATUS --node-interval SECONDS --node-timeout SECONDS]\n"
                  "  [--failover-file PATH] [--latency-file PATH] [--recover-xray [--recovery-state PATH]]\n"
-                 "  [--login-file PATH] [--restore-lan-redirect [--redirect-state PATH]]");
+                 "  [--login-file PATH] [--restore-lan-redirect [--redirect-state PATH]]\n"
+                 "  [--probe-core PATH]  core binary for HTTPS checks; default: the one v2rayA runs");
             return 0;
         default: return 2;
         }
     }
-    if (optind != argc || (metrics && !valid_observatory_url(metrics)) ||
+    if (optind != argc || (metrics && !valid_observatory_url(metrics)) || (probe_core && *probe_core != '/') ||
         (recovery_state && (!recover_xray || *recovery_state != '/')) ||
         (redirect_state && (!restore_redirect || *redirect_state != '/' ||
                             (recovery_state && !strcmp(redirect_state, recovery_state))))) {
@@ -404,6 +430,15 @@ int main(int argc, char **argv)
               stderr);
         login_file = NULL;
     }
+#if LIBCURL_VERSION_NUM < 0x075000
+    /* These send credentials or start processes only after checking which local
+     * process accepted the connection, which needs CURLOPT_PREREQFUNCTION (7.80). */
+    if (recover_xray || restore_redirect || login_file)
+        fputs("core recovery, LAN REDIRECT restoration and login renewal disabled: libcurl 7.80 or newer is required\n",
+              stderr);
+    recover_xray = restore_redirect = 0;
+    login_file = NULL;
+#endif
     if (curl_global_init(CURL_GLOBAL_DEFAULT) != CURLE_OK) return 1;
     if (https.url && (!xray_config || !https_target(https.url, https.host, sizeof(https.host), &https.port))) {
         fputs("node probes require a core config and a valid HTTPS target\n", stderr);
@@ -448,6 +483,7 @@ int main(int argc, char **argv)
     struct lan_ingress_watch ingress_watch = {0};
     if (repair) lan_ingress_init(repair, redirect_state, api, xray_config);
     struct login_refresh login = {.credentials_path = login_file};
+    struct environment environment = {0};
     struct inventory current = {0};
     long ttl = 2 * interval + 6 * timeout + 2;
     int trusted = 0, rc = 0;
@@ -496,6 +532,7 @@ int main(int argc, char **argv)
             struct probe_job jobs[16];
             size_t count = pick_jobs(&current, jobs, (size_t)workers, interval, &backlog, 0);
             probe_members(jobs, count, timeout * 1000, mark, NULL, NULL);
+            if (https.url && profiles) locate_core(&environment, api, xray_config, probe_core, &https);
             if (https.url && profiles) {
                 count = pick_jobs(&current, jobs, (size_t)workers, https.interval, &backlog, 1);
                 probe_members(jobs, count, https.timeout * 1000, mark, &https, profiles);
@@ -542,6 +579,7 @@ sleep_cycle:
         if (!rc && !stopping) sleep((unsigned)wait);
     }
     free_inventory(&current);
+    environment_free(&environment);
     lan_ingress_close(repair);
     core_recovery_close(&recovery);
     failover_monitor_free(failover);

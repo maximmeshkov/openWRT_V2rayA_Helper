@@ -13,7 +13,8 @@ const char *rpc_string(json_object *request, const char *key)
 
 json_object *read_rpc_json(void)
 {
-    char buffer[8192];
+    /* A full failover policy (64 reserves, 64 subscriptions, 64 excluded hosts) fits. */
+    static char buffer[65536];
     size_t n = fread(buffer, 1, sizeof(buffer), stdin);
     if (!n || n == sizeof(buffer) || ferror(stdin)) return NULL;
     json_object *request = parse_utf8_json(buffer, n);

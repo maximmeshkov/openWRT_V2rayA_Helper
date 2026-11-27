@@ -1,5 +1,5 @@
 #include "core_recovery.h"
-#include "failover_api.h"
+#include "capability.h"
 #include "helper.h"
 #include "node_profile.h"
 #include "recovery_checkpoint.h"
@@ -208,8 +208,8 @@ const char *core_recovery_tick(struct core_recovery *state, const struct v2raya_
     } else if (now - state->missing_since >= confirmation_ms &&
                (!state->last_attempt || now - state->last_attempt >= recovery_pause_ms) && !*stopping) {
         char error[160] = {0};
-        if (!failover_api_can_switch(api, error, sizeof(error))) {
-            message = "Xray recovery requires v2rayA 2.2.7.4 with Xray";
+        if (capability_check_api(api, FEATURE_CORE_START, error, sizeof(error)) == CAPABILITY_DENIED) {
+            message = "Starting a crashed core is not verified for this v2rayA version";
         } else if (result != CORE_WATCH_PORT_BUSY) {
             const char *port_error = unavailable_ports(api, config, &observation, stopping);
             if (port_error) {
