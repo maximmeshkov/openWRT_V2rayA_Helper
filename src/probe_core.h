@@ -20,7 +20,8 @@ int probe_core_ports(int *ports, size_t count);
 /* Start the core with the config on stdin. Returns its PID once every port
  * accepts connections, or -1 when it exits or startup_ms passes first. */
 pid_t probe_core_start(const struct core_kind *kind, const char *binary, json_object *config,
-                       const int *ports, size_t count, long startup_ms);
+                       const int *ports, size_t count, int startup_ms);
 void probe_core_stop(pid_t core);
+void probe_core_reap(void);
 
 #endif

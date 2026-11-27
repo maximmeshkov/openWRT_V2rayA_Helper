@@ -21,6 +21,11 @@ UUID = "00000000-0000-4000-9000-000000000001"
 FAKE_CORE = r'''#!{python}
 import json, os, socket, sys, threading
 routes = json.load(open({routes!r}))
+stalled = routes.get("stall_once")
+if stalled and not os.path.exists(stalled):
+    with open(stalled, "w") as marker:
+        marker.write(str(os.getpid()))
+    threading.Event().wait()
 config = json.load(sys.stdin)
 with open({record!r}, "a") as out:
     out.write(json.dumps({{"argv": sys.argv[1:], "pid": os.getpid(), "env": sorted(os.environ),
@@ -101,10 +106,10 @@ class ProbeCoreTest(MonitorHarness):
         self.addCleanup(origin.shutdown)
 
         self.live_port, self.dead_port = 40001, 40002
-        routes, self.record = root / "routes.json", root / "core-calls.jsonl"
-        routes.write_text(json.dumps({"origin": origin.server_address[1], "dead": [self.dead_port]}))
+        self.routes, self.record = root / "routes.json", root / "core-calls.jsonl"
+        self.routes.write_text(json.dumps({"origin": origin.server_address[1], "dead": [self.dead_port]}))
         self.core = root / "fake-core"
-        self.core.write_text(FAKE_CORE.format(python=sys.executable, routes=str(routes), record=str(self.record)))
+        self.core.write_text(FAKE_CORE.format(python=sys.executable, routes=str(self.routes), record=str(self.record)))
         self.core.chmod(0o755)
         self.config = root / "config.json"
 
@@ -157,6 +162,35 @@ class ProbeCoreTest(MonitorHarness):
                      Path(f"/proc/{pid}/stat").read_text().split(")")[-1].split()[0] != "Z"}
             time.sleep(0.05)
         self.assertEqual(alive, set(), "a probe core outlived its batch")
+
+    def test_startup_times_out_when_core_does_not_read_config(self):
+        stalled = self.routes.with_name("stalled-core.pid")
+        routes = json.loads(self.routes.read_text())
+        routes["stall_once"] = str(stalled)
+        self.routes.write_text(json.dumps(routes))
+        self.config.write_text(json.dumps({"outbounds": [{
+            "tag": "proxy", "protocol": "vless", "settings": {"vnext": [{
+                "address": "127.0.0.1", "port": self.live_port, "users": [{"id": UUID, "encryption": "none"}]}]},
+            # A config larger than the pipe forces the writer to wait for the reader.
+            "streamSettings": {"network": "xhttp", "xhttpSettings": {"path": "/" + "x" * (256 * 1024)}},
+        }]}))
+        self.api.servers = [profile(1, "Live", f"127.0.0.1:{self.live_port}", "vless(xhttp)")]
+        self.api.connected = [assignment("proxy", 1)]
+
+        def https(snapshot):
+            members = rows(snapshot).get("proxy", {}).get("members", [])
+            return members[0].get("https", {}) if members else {}
+
+        with patch.dict(os.environ, SSL_CERT_FILE=self.cert):
+            self.start("--node-url", "https://check.invalid/generate_204", "--node-timeout", "2",
+                       "--node-interval", "1", "--xray-config", str(self.config), "--probe-core", str(self.core))
+
+        unavailable = self.wait_for(lambda s: https(s).get("detail") == "probe_core_unavailable", timeout=9)
+        self.assertEqual(https(unavailable)["state"], "unknown")
+        self.assertTrue(stalled.exists(), "the core must have started and stalled before reading stdin")
+        recovered = self.wait_for(lambda s: https(s).get("http_code") == 204)
+        self.assertEqual(https(recovered)["state"], "ok")
+        self.assertFalse(Path("/proc", stalled.read_text()).exists(), "the stalled core was not reaped")
 
     def test_plain_proxies_need_no_core(self):
         self.config.write_text(json.dumps({"outbounds": [{"tag": "proxy", "protocol": "socks", "settings": {

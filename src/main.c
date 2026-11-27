@@ -10,6 +10,7 @@
 #include "login_refresh.h"
 #include "environment.h"
 #include "core_kind.h"
+#include "probe_core.h"
 #include <curl/curl.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -491,6 +492,7 @@ int main(int argc, char **argv)
     const struct lan_ingress unobserved = {0};
     if (publish(output, runtime, &current, "starting", NULL, ttl, route_ttl, &https, unobserved)) rc = 1;
     while (!stopping && !rc) {
+        probe_core_reap();
         if (!runtime_is_current(runtime)) {
             rc = 1;
             break;

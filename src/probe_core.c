@@ -3,6 +3,7 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <poll.h>
 #include <signal.h>
 #include <stdio.h>
@@ -131,8 +132,35 @@ static int64_t monotonic_ms(void)
 	return now.tv_sec * INT64_C(1000) + now.tv_nsec / 1000000;
 }
 
-static int accepts(int port)
+static int remaining_ms(int64_t deadline)
 {
+	int64_t remaining = deadline - monotonic_ms();
+	if (remaining <= 0) return 0;
+	return remaining > INT_MAX ? INT_MAX : (int)remaining;
+}
+
+static int send_config(int fd, const char *text, int64_t deadline)
+{
+	struct pollfd channel = {.fd = fd, .events = POLLOUT};
+	size_t length = strlen(text), written = 0;
+	while (written < length) {
+		int left = remaining_ms(deadline);
+		if (!left) return 0;
+		int ready = poll(&channel, 1, left);
+		if (ready < 0 && errno == EINTR) continue;
+		if (ready != 1 || !(channel.revents & POLLOUT)) return 0;
+		ssize_t n = write(fd, text + written, length - written);
+		if (n < 0 && (errno == EINTR || errno == EAGAIN)) continue;
+		if (n <= 0) return 0;
+		written += (size_t)n;
+	}
+	return 1;
+}
+
+static int accepts(int port, int64_t deadline)
+{
+	int left = remaining_ms(deadline);
+	if (!left) return 0;
 	struct sockaddr_in address = {.sin_family = AF_INET, .sin_port = htons((uint16_t)port),
 	                              .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
 	int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
@@ -143,7 +171,8 @@ static int accepts(int port)
 		if (error == EINPROGRESS) {
 			struct pollfd event = {.fd = fd, .events = POLLOUT};
 			socklen_t length = sizeof(error);
-			if (poll(&event, 1, 50) != 1 || getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &length)) error = EIO;
+			if (poll(&event, 1, left < 50 ? left : 50) != 1 ||
+			    getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &length)) error = EIO;
 		}
 	}
 	close(fd);
@@ -165,38 +194,46 @@ static void run_child(pid_t parent, int input, const struct core_kind *kind, con
 	_exit(126);
 }
 
-pid_t probe_core_start(const struct core_kind *kind, const char *binary, json_object *config,
-                       const int *ports, size_t count, long startup_ms)
+/* Batches and reserve checks run serially. Do not start another core while
+ * the last child is still exiting, or block the monitor waiting for it. */
+static pid_t stopping_core;
+
+void probe_core_reap(void)
 {
-	if (!kind || !binary || *binary != '/' || !config || !count) return -1;
+	if (!stopping_core) return;
+	pid_t exited = waitpid(stopping_core, NULL, WNOHANG);
+	if (exited == stopping_core || (exited < 0 && errno == ECHILD)) stopping_core = 0;
+}
+
+pid_t probe_core_start(const struct core_kind *kind, const char *binary, json_object *config,
+                       const int *ports, size_t count, int startup_ms)
+{
+	probe_core_reap();
+	if (stopping_core || !kind || !binary || *binary != '/' || !config || !count || startup_ms <= 0) return -1;
 	const char *text = json_object_to_json_string_ext(config, JSON_C_TO_STRING_PLAIN);
 	int input[2];
 	if (!text || pipe2(input, O_CLOEXEC)) return -1;
-	pid_t parent = getpid(), core = fork();
-	if (core == 0) run_child(parent, input[0], kind, binary);
-	close(input[0]);
-	size_t length = strlen(text), written = 0;
-	while (core > 0 && written < length) {
-		ssize_t n = write(input[1], text + written, length - written);
-		if (n < 0 && errno == EINTR) continue;
-		if (n <= 0) break;
-		written += (size_t)n;
-	}
-	close(input[1]);
-	if (core < 0) return -1;
-	if (written < length) {
-		probe_core_stop(core);
+	/* The child gets a blocking stdin. Only the parent's writer is nonblocking. */
+	if (fcntl(input[1], F_SETFL, O_NONBLOCK) < 0) {
+		close(input[0]);
+		close(input[1]);
 		return -1;
 	}
 	int64_t deadline = monotonic_ms() + startup_ms;
-	for (;;) {
-		if (waitpid(core, NULL, WNOHANG) == core) return -1;
+	pid_t parent = getpid(), core = fork();
+	if (core == 0) run_child(parent, input[0], kind, binary);
+	close(input[0]);
+	int sent = core > 0 && send_config(input[1], text, deadline);
+	close(input[1]);
+	if (core < 0) return -1;
+	while (sent && remaining_ms(deadline)) {
+		pid_t exited = waitpid(core, NULL, WNOHANG);
+		if (exited == core || (exited < 0 && errno == ECHILD)) return -1;
 		size_t ready = 0;
-		while (ready < count && accepts(ports[ready])) ready++;
+		while (ready < count && accepts(ports[ready], deadline)) ready++;
 		if (ready == count) return core;
-		if (monotonic_ms() >= deadline) break;
-		struct timespec pause = {.tv_nsec = 20 * 1000000};
-		nanosleep(&pause, NULL);
+		int left = remaining_ms(deadline);
+		if (left) poll(NULL, 0, left < 20 ? left : 20);
 	}
 	probe_core_stop(core);
 	return -1;
@@ -206,5 +243,6 @@ void probe_core_stop(pid_t core)
 {
 	if (core <= 0) return;
 	kill(core, SIGKILL);
-	while (waitpid(core, NULL, 0) < 0 && errno == EINTR) {}
+	stopping_core = core;
+	probe_core_reap();
 }
