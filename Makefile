@@ -2,7 +2,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=v2raya-helper
 PKG_VERSION:=0.1.0
-PKG_RELEASE:=53
+PKG_RELEASE:=54
 
 # LuCI's asset version follows luci-base. Give these views package-specific URLs.
 VIEW_VERSION:=$(subst .,-,$(PKG_VERSION))-$(PKG_RELEASE)
