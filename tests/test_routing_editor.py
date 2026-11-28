@@ -99,10 +99,10 @@ class RoutingEditorTest(unittest.TestCase):
         self.addCleanup(self.server.server_close)
         self.addCleanup(self.server.shutdown)
 
-    def command(self, action, request=None):
+    def command(self, action, request=None, api_path="/ui/"):
         proc = subprocess.run(
             [os.environ["V2RAYA_HELPER"], "routing", action,
-             f"http://127.0.0.1:{self.server.server_port}/ui/", self.token, self.lock],
+             f"http://127.0.0.1:{self.server.server_port}{api_path}", self.token, self.lock],
             input=json.dumps(request) if request is not None else "",
             capture_output=True, text=True, timeout=10, check=True,
         )
@@ -122,6 +122,18 @@ class RoutingEditorTest(unittest.TestCase):
         }
         request.update(overrides)
         return request
+
+    def test_restart_requires_confirmation_and_a_trusted_local_v2raya(self):
+        for request in ({}, {"confirm": False}, {"confirm": "true"}):
+            reply = self.command("restart", request, api_path="/")
+            self.assertFalse(reply["ok"], reply)
+            self.assertIn("Confirm", reply["error"])
+        self.assertEqual(self.requests, [])
+
+        # The configured loopback port is a Python fixture, not the owned v2rayA daemon.
+        reply = self.command("restart", {"confirm": True}, api_path="/")
+        self.assertFalse(reply["ok"], reply)
+        self.assertEqual(self.requests, [])
 
     def test_context_and_preview_are_read_only(self):
         context = self.command("context")

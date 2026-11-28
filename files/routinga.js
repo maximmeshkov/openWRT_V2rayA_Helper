@@ -1,6 +1,7 @@
 'use strict';
 'require view';
 'require rpc';
+'require ui';
 'require v2raya-helper.menu as helperMenu';
 
 var ruleParams = ['kind', 'value', 'outbound', 'before_line', 'revision'];
@@ -21,6 +22,13 @@ var saveRule = rpc.declare({
 	object: 'v2raya-helper',
 	method: 'routing_save',
 	params: ruleParams,
+	expect: { '': {} },
+	reject: true
+});
+var restartCore = rpc.declare({
+	object: 'v2raya-helper',
+	method: 'routing_restart',
+	params: ['confirm'],
 	expect: { '': {} },
 	reject: true
 });
@@ -148,6 +156,7 @@ return view.extend({
 		var code = E('pre', { 'hidden': '', 'tabindex': '0', 'aria-label': _('Rule preview') });
 		var previewButton = E('button', { 'type': 'submit', 'class': 'btn cbi-button cbi-button-action' }, [_('Preview rule')]);
 		var saveButton = E('button', { 'type': 'button', 'class': 'btn cbi-button cbi-button-save' }, [_('Add rule')]);
+		var restartButton = E('button', { 'type': 'button', 'class': 'btn cbi-button cbi-button-neutral' }, [_('Restart Xray now')]);
 		var reloadButton = E('button', { 'type': 'button', 'class': 'btn cbi-button cbi-button-neutral' }, [_('Refresh')]);
 		var fields = E('fieldset', { 'class': 'cbi-section' }, [
 			formRow(_('Match type'), kind),
@@ -161,6 +170,7 @@ return view.extend({
 
 		function updateControls() {
 			var canSave = !!(context && context.can_save && canWrite);
+			var canRestart = !!(context && context.can_restart && canWrite);
 			var ready = !!(address.value.trim() && outbound.value);
 			var needsValidator = canSave && advanced(kind.value) && !context.validate_advanced;
 			fields.disabled = busy || !context;
@@ -168,6 +178,8 @@ return view.extend({
 			saveButton.style.display = canSave ? '' : 'none';
 			saveButton.disabled = busy || !canSave || !ready || needsValidator;
 			saveButton.textContent = canSave && context.save_verified === false ? _('Add rule (may restart core)') : _('Add rule');
+			restartButton.style.display = canRestart ? '' : 'none';
+			restartButton.disabled = busy || !canRestart;
 			reloadButton.disabled = busy;
 			formHint.textContent = context && !busy ? (
 				!address.value.trim() ? _('Enter an address.') : !outbound.value ? _('Choose an outbound.') :
@@ -363,8 +375,6 @@ return view.extend({
 				context = null;
 				var saved = saveMayRestart ? _('Rule saved in RoutingA.') :
 					_('Rule saved in RoutingA. It will take effect on the next core configuration rebuild.');
-			if (!saveMayRestart)
-				saved += ' ' + _('To apply now, click the Running status in v2rayA to stop the core, then click Ready to start it again. This interrupts active proxy connections.');
 				showStatus(saved, 'success');
 				var refreshed = await readContext().catch(function() { return {}; });
 				populate(refreshed);
@@ -373,6 +383,34 @@ return view.extend({
 				if (typeof reply.rule === 'string')
 					showRule(reply.rule, _('Saved rule'));
 			}, _('Could not confirm the rule was saved. Refresh before retrying.'));
+		}
+
+		function handleRestartCore() {
+			if (restartButton.disabled) return;
+			var cancel = E('button', { 'type': 'button', 'class': 'btn cbi-button-neutral' }, [_('Cancel')]);
+			var confirm = E('button', { 'type': 'button', 'class': 'btn cbi-button-negative' }, [_('Restart Xray')]);
+			var unable = _('Could not confirm the Xray restart. Check its status before retrying.');
+			cancel.addEventListener('click', function() {
+				ui.hideModal();
+				restartButton.focus();
+			});
+			confirm.addEventListener('click', function() {
+				ui.hideModal();
+				return run(async function() {
+					showStatus(_('Restarting Xray…'));
+					var reply = await restartCore(true);
+					if (!reply || reply.ok !== true) {
+						showStatus(responseError(reply, unable), 'warning');
+						return;
+					}
+					showStatus(_('Xray restarted. v2rayA rebuilt its configuration.'), 'success');
+				}, unable);
+			});
+			ui.showModal(_('Restart Xray now?'), [
+				E('p', {}, [_('This rebuilds the v2rayA configuration and interrupts active proxy connections.')]),
+				E('div', { 'class': 'right' }, [cancel, ' ', confirm])
+			]);
+			cancel.focus();
 		}
 
 		address.addEventListener('input', edited);
@@ -406,6 +444,7 @@ return view.extend({
 			positionButton.focus();
 		});
 		saveButton.addEventListener('click', handleSaveRule);
+		restartButton.addEventListener('click', handleRestartCore);
 		reloadButton.addEventListener('click', function() {
 			return run(async function() {
 				clearPreview();
@@ -425,7 +464,7 @@ return view.extend({
 			E('form', { 'submit': handlePreview }, [
 				fields, formHint, status, code,
 				E('div', { 'class': 'cbi-page-actions', 'style': 'display:flex;flex-wrap:wrap;gap:.5em;justify-content:flex-start' },
-					[saveButton, previewButton, reloadButton])
+					[saveButton, previewButton, restartButton, reloadButton])
 			])
 		]);
 	}

@@ -2,7 +2,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=v2raya-helper
 PKG_VERSION:=0.1.0
-PKG_RELEASE:=54
+PKG_RELEASE:=55
 
 # LuCI's asset version follows luci-base. Give these views package-specific URLs.
 VIEW_VERSION:=$(subst .,-,$(PKG_VERSION))-$(PKG_RELEASE)
@@ -66,6 +66,7 @@ if [ -z "$${IPKG_INSTROOT}" ]; then
 	methods="$$(ubus -v list v2raya-helper 2>/dev/null)"
 	if ! printf '%s\n' "$$methods" | grep -q '"latency"' ||
 	   ! printf '%s\n' "$$methods" | grep -q '"geodata_start"' ||
+	   ! printf '%s\n' "$$methods" | grep -q '"routing_restart"' ||
 	   ! printf '%s\n' "$$methods" | grep -q '"environment"'; then
 		/etc/init.d/rpcd reload
 	fi

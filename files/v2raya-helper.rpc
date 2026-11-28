@@ -34,7 +34,7 @@ run_helper() {
 			state_file=/var/run/v2raya-helper/routing.lock ;;
 		failover) state_file=/etc/config/v2raya-helper-failover.json ;;
 	esac
-	if [ "$1" = routing ] && [ "$local_api" = 1 ]; then
+	if [ "$1" = routing ] && [ "$2" != restart ] && [ "$local_api" = 1 ]; then
 		# The running core of v2rayA, whatever its binary is called, and its geo files.
 		environment="$(/usr/bin/v2raya-helper env "$api" "$config")"
 		core="$(printf '%s' "$environment" | jsonfilter -e '@.core.binary' 2>/dev/null)"
@@ -62,7 +62,7 @@ run_geodata() {
 
 case "$1" in
 	list)
-		printf '%s\n' '{"status":{},"environment":{},"latency":{"outbound":""},"routing_context":{},"routing_preview":{"kind":"","value":"","outbound":"","before_line":0,"revision":""},"routing_save":{"kind":"","value":"","outbound":"","before_line":0,"revision":""},"failover_context":{},"failover_save":{"policy":{}},"geodata_status":{},"geodata_start":{"action":""}}'
+		printf '%s\n' '{"status":{},"environment":{},"latency":{"outbound":""},"routing_context":{},"routing_preview":{"kind":"","value":"","outbound":"","before_line":0,"revision":""},"routing_save":{"kind":"","value":"","outbound":"","before_line":0,"revision":""},"routing_restart":{"confirm":false},"failover_context":{},"failover_save":{"policy":{}},"geodata_status":{},"geodata_start":{"action":""}}'
 		;;
 	call)
 		case "$2" in
@@ -71,6 +71,7 @@ case "$1" in
 			routing_context) run_helper routing context ;;
 			routing_preview) run_helper routing preview ;;
 			routing_save) run_helper routing save ;;
+			routing_restart) run_helper routing restart ;;
 			failover_context) run_helper failover context ;;
 			failover_save) run_helper failover save ;;
 			geodata_status) exec /usr/libexec/v2raya-helper-geodata status ;;

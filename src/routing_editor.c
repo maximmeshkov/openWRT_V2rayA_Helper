@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #include "helper.h"
 #include "capability.h"
+#include "core_watch.h"
 #include "routing_document.h"
 #include "routing_editor.h"
 #include "routing_validate.h"
@@ -41,6 +42,57 @@ static int outbound_ready(const struct inventory *inv, const char *name)
     return 0;
 }
 
+static int restart_available(const struct v2raya_api *api, json_object *version)
+{
+#if LIBCURL_VERSION_NUM >= 0x075000
+    char reason[160];
+    return api->token_file && core_watch_local_api(api->base) &&
+        capability_decide(version, FEATURE_CORE_START, reason, sizeof(reason)) == CAPABILITY_VERIFIED;
+#else
+    (void)api;
+    (void)version;
+    return 0;
+#endif
+}
+
+static int running_core(const struct v2raya_api *api, char *error, size_t len)
+{
+    json_object *touch = v2raya_api_touch_data(api, error, len);
+    if (!touch) return -1;
+    json_object *running = json_object_object_get(touch, "running");
+    int state = json_object_is_type(running, json_type_boolean) ? json_object_get_boolean(running) : -1;
+    json_object_put(touch);
+    if (state < 0) snprintf(error, len, "Cannot read the Xray running state");
+    return state;
+}
+
+static const char *restart_xray(struct v2raya_api api, char *error, size_t len)
+{
+    if (!core_watch_local_api(api.base) || !api.token_file)
+        return "Restart requires the router's local v2rayA API and authorization";
+    volatile sig_atomic_t stopping = 0;
+    struct core_watch_peer peer = {.api = api.base, .stopping = &stopping};
+    api.connected_peer = core_watch_verify_peer;
+    api.peer_context = &peer;
+    json_object *version = v2raya_api_version_data(&api, error, len);
+    if (!version) return *error ? error : "Cannot verify the local v2rayA process";
+    int supported = restart_available(&api, version);
+    json_object_put(version);
+    if (!supported) return "Restart is not verified for this local v2rayA and core";
+
+    int running = running_core(&api, error, len);
+    if (running < 0) return error;
+    if (!running) return "Xray is stopped";
+    /* On verified v2rayA versions, a single POST rebuilds the core config and
+     * restarts the running core under v2rayA's own update lock. */
+    struct v2raya_api restart_api = api;
+    restart_api.timeout_ms = 12000;
+    if (v2raya_api_start_core(&restart_api, core_watch_verify_peer, &peer, error, len) ||
+        running_core(&api, error, len) != 1)
+        return "Could not confirm the Xray restart. Check its status before retrying.";
+    return NULL;
+}
+
 static void add_outbound(json_object *rows, const char *name, int available)
 {
     json_object *row = json_object_new_object();
@@ -71,7 +123,8 @@ static json_object *position_label(const struct routing_position *position)
 }
 
 static void show_context(json_object *reply, const struct inventory *inv, const char *version,
-                         enum capability save, const char *document, const char *digest, int advanced)
+                         enum capability save, const char *document, const char *digest, int advanced,
+                         int can_restart)
 {
     json_object *outbounds = json_object_new_array(), *positions = json_object_new_array();
     json_object_object_add(reply, "outbounds", outbounds);
@@ -79,6 +132,7 @@ static void show_context(json_object *reply, const struct inventory *inv, const 
     json_object_object_add(reply, "revision", json_object_new_string(digest));
     json_object_object_add(reply, "version", json_object_new_string(version));
     json_object_object_add(reply, "can_save", json_object_new_boolean(save != CAPABILITY_DENIED));
+    json_object_object_add(reply, "can_restart", json_object_new_boolean(can_restart && inv->running));
     /* Outside the verified builds a save may make v2rayA restart its core. */
     json_object_object_add(reply, "save_verified", json_object_new_boolean(save == CAPABILITY_VERIFIED));
     json_object_object_add(reply, "validate_advanced", json_object_new_boolean(advanced));
@@ -105,7 +159,8 @@ int routing_editor_command(int argc, char **argv)
 {
     if (argc != 4 && argc != 6) return 2;
     const int context = !strcmp(argv[0], "context"), save = !strcmp(argv[0], "save");
-    if (!context && !save && strcmp(argv[0], "preview")) return 2;
+    const int restart = !strcmp(argv[0], "restart");
+    if (!context && !save && !restart && strcmp(argv[0], "preview")) return 2;
     struct v2raya_api api = {.base = argv[1], .token_file = *argv[2] ? argv[2] : NULL, .timeout_ms = 2000};
     struct inventory inv = {0};
     json_object *request = NULL, *reply = json_object_new_object();
@@ -118,7 +173,14 @@ int routing_editor_command(int argc, char **argv)
         failure = "Invalid rule request";
         goto done;
     }
-    if (save) {
+    if (restart) {
+        json_object *confirmed = json_object_object_get(request, "confirm");
+        if (!json_object_is_type(confirmed, json_type_boolean) || !json_object_get_boolean(confirmed)) {
+            failure = "Confirm that active proxy connections will be interrupted";
+            goto done;
+        }
+    }
+    if (save || restart) {
         lock = open(argv[3], O_WRONLY | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
         if (lock < 0 || flock(lock, LOCK_EX | LOCK_NB) < 0) {
             failure = "RoutingA is busy or its lock is unavailable";
@@ -130,6 +192,10 @@ int routing_editor_command(int argc, char **argv)
         goto done;
     }
     initialized = 1;
+    if (restart) {
+        failure = restart_xray(api, error, sizeof(error));
+        goto done;
+    }
     if (!(version_data = v2raya_api_version_data(&api, error, sizeof(error))) ||
         !json_object_object_get_ex(version_data, "version", &version) ||
         !json_object_is_type(version, json_type_string) ||
@@ -144,7 +210,7 @@ int routing_editor_command(int argc, char **argv)
         char reason[160];
         show_context(reply, &inv, json_object_get_string(version),
                      capability_decide(version_data, FEATURE_ROUTING_SAVE, reason, sizeof(reason)),
-                     document, digest, argc == 6 && core);
+                     document, digest, argc == 6 && core, restart_available(&api, version_data));
         goto done;
     }
     const char *base = rpc_string(request, "revision");

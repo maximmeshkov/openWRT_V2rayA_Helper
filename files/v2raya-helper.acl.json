@@ -20,7 +20,7 @@
 		}
 	},
 	"v2raya-helper-routing": {
-		"description": "Read and edit v2rayA RoutingA rules",
+		"description": "Read and edit v2rayA RoutingA rules and restart its Xray core",
 		"read": {
 			"ubus": {
 				"v2raya-helper": [ "routing_context", "routing_preview" ]
@@ -28,7 +28,7 @@
 		},
 		"write": {
 			"ubus": {
-				"v2raya-helper": [ "routing_save" ]
+				"v2raya-helper": [ "routing_save", "routing_restart" ]
 			}
 		}
 	},
